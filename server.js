@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 
 /*
- * Lumen public self-contained Railway service installer — v22.0.0
+ * Lumen public self-contained Railway service installer — v23.0.0
  * Every user deploys this folder as a service in their own Railway account.
  * Runs on Node.js 22 with node:net/node:tls.
  * It does not persist submitted tokens and never writes them to logs.
@@ -16,7 +16,7 @@ const SOURCE_REPO = "Lumen-Project-Final";
 const SOURCE_FULL = SOURCE_OWNER + "/" + SOURCE_REPO;
 const GITHUB_API = "https://api.github.com";
 const RAILWAY_API = "https://backboard.railway.com/graphql/v2";
-const INSTALLER_VERSION = "22.0.0";
+const INSTALLER_VERSION = "23.0.0";
 const MAX_BODY_BYTES = 24 * 1024;
 const MAX_UPSTREAM_BYTES = 4 * 1024 * 1024;
 const HTTP_PROXIES = Object.freeze([
@@ -29,6 +29,7 @@ const HTTP_PROXIES = Object.freeze([
 ]);
 const PROXY_PROBE_TIMEOUT_MS = 8000;
 const DIRECT_PROBE_TIMEOUT_MS = 10000;
+const NETWORK_SELECTION_TIMEOUT_MS = 45000;
 const ALLOWED_UPSTREAMS = new Set(["api.github.com", "backboard.railway.com"]);
 
 class InstallError extends Error {
@@ -135,18 +136,29 @@ function openProxyTunnel(targetHostname, timeoutMs, proxy) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let handshake = Buffer.alloc(0);
+    let secure = null;
     const raw = net.createConnection({ host: proxy.hostname, port: proxy.port });
+    const timeoutError = () => transportError("HTTP_PROXY_TIMEOUT", "The configured HTTP proxy timed out.", "زمان انتظار پروکسی HTTP تنظیم‌شده به پایان رسید.", 504);
+    let watchdog = null;
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      if (watchdog) clearTimeout(watchdog);
+      try { if (secure) secure.destroy(); } catch (_) {}
       try { raw.destroy(); } catch (_) {}
       reject(error instanceof InstallError ? error : transportError("HTTP_PROXY_UNAVAILABLE", "The configured HTTP proxy could not establish a secure connection.", "پروکسی HTTP تنظیم‌شده نتوانست اتصال امن را برقرار کند."));
     };
+    // A socket timeout alone is insufficient during every TLS edge case. This
+    // independent wall-clock watchdog guarantees that a dead proxy can never
+    // leave deploymentNetworkState stuck on `checking` forever.
+    watchdog = setTimeout(() => fail(timeoutError()), timeoutMs);
     raw.setNoDelay(true);
-    raw.setTimeout(timeoutMs, () => fail(transportError("HTTP_PROXY_TIMEOUT", "The configured HTTP proxy timed out.", "زمان انتظار پروکسی HTTP تنظیم‌شده به پایان رسید.", 504)));
+    raw.setTimeout(timeoutMs, () => fail(timeoutError()));
     raw.once("error", fail);
+    raw.once("end", () => fail(transportError("HTTP_PROXY_CLOSED", "The configured HTTP proxy closed the tunnel early.", "پروکسی HTTP تونل را زودتر از موعد بست.")));
+    raw.once("close", () => fail(transportError("HTTP_PROXY_CLOSED", "The configured HTTP proxy closed the tunnel early.", "پروکسی HTTP تونل را زودتر از موعد بست.")));
     raw.once("connect", () => {
-      raw.write("CONNECT " + targetHostname + ":443 HTTP/1.1\r\nHost: " + targetHostname + ":443\r\nProxy-Connection: keep-alive\r\nUser-Agent: Lumen-Installer-Proxy/21\r\n\r\n");
+      raw.write("CONNECT " + targetHostname + ":443 HTTP/1.1\r\nHost: " + targetHostname + ":443\r\nProxy-Connection: keep-alive\r\nUser-Agent: Lumen-Installer-Proxy/23\r\n\r\n");
     });
     const onData = (chunk) => {
       handshake = Buffer.concat([handshake, Buffer.from(chunk)]);
@@ -160,17 +172,19 @@ function openProxyTunnel(targetHostname, timeoutMs, proxy) {
       if (handshake.length !== boundary + 4) return fail(transportError("HTTP_PROXY_INJECTION", "The HTTP proxy returned unexpected bytes before TLS.", "پروکسی HTTP پیش از TLS داده غیرمنتظره فرستاد."));
       raw.setTimeout(0);
       raw.off("error", fail);
-      const secure = tls.connect({ socket: raw, servername: targetHostname, rejectUnauthorized: true, ALPNProtocols: ["http/1.1"] });
-      secure.setTimeout(timeoutMs, () => {
-        try { secure.destroy(); } catch (_) {}
-      });
+      secure = tls.connect({ socket: raw, servername: targetHostname, rejectUnauthorized: true, ALPNProtocols: ["http/1.1"] });
+      secure.setTimeout(timeoutMs, () => fail(timeoutError()));
       secure.once("error", fail);
+      secure.once("end", () => fail(transportError("UPSTREAM_TLS_CLOSED", "The secure proxy connection closed during setup.", "اتصال امن پروکسی هنگام راه‌اندازی بسته شد.")));
+      secure.once("close", () => fail(transportError("UPSTREAM_TLS_CLOSED", "The secure proxy connection closed during setup.", "اتصال امن پروکسی هنگام راه‌اندازی بسته شد.")));
       secure.once("secureConnect", () => {
         if (settled) return;
         if (!secure.authorized || (secure.alpnProtocol && secure.alpnProtocol !== "http/1.1")) {
           return fail(transportError("UPSTREAM_TLS_FAILED", "The secure connection through the proxy could not be verified.", "اتصال امن از داخل پروکسی قابل تأیید نبود."));
         }
         settled = true;
+        if (watchdog) clearTimeout(watchdog);
+        secure.setTimeout(0);
         secure.off("error", fail);
         resolve(secure);
       });
@@ -318,7 +332,7 @@ async function probeRoute(route, index) {
   let failureCode = "PROBE_FAILED";
   try {
     const githubResponse = await routeFetch(route, GITHUB_API + "/meta", {
-      method: "GET", headers: { Accept: "application/vnd.github+json", "User-Agent": "Lumen-Network-Probe/22" },
+      method: "GET", headers: { Accept: "application/vnd.github+json", "User-Agent": "Lumen-Network-Probe/23" },
     }, route.kind === "direct" ? DIRECT_PROBE_TIMEOUT_MS : PROXY_PROBE_TIMEOUT_MS);
     if (!githubResponse.ok) throw new Error("GitHub HTTP " + githubResponse.status);
     githubOk = true;
@@ -329,7 +343,7 @@ async function probeRoute(route, index) {
   // parallel, staying within Railway's six simultaneous socket limit.
   try {
     const railwayResponse = await routeFetch(route, RAILWAY_API, {
-      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "Lumen-Network-Probe/22" },
+      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "Lumen-Network-Probe/23" },
       body: JSON.stringify({ query: "query LumenNetworkProbe { __typename }", variables: {} }),
     }, route.kind === "direct" ? DIRECT_PROBE_TIMEOUT_MS : PROXY_PROBE_TIMEOUT_MS);
     if (railwayResponse.status < 200 || railwayResponse.status >= 500) throw new Error("Railway HTTP " + railwayResponse.status);
@@ -349,7 +363,7 @@ async function probeRoute(route, index) {
   };
 }
 
-async function selectTransport() {
+async function selectTransportInternal() {
   // Every proxy is tested from the running Railway deployment before one is chosen.
   const proxyRoutes = HTTP_PROXIES.map((proxy) => ({ kind: "proxy", proxy }));
   const proxyChecks = await Promise.all(proxyRoutes.map((route, index) => probeRoute(route, index)));
@@ -363,6 +377,26 @@ async function selectTransport() {
   const error = new InstallError("ALL_NETWORK_ROUTES_FAILED", "network", "All configured proxies and the direct Railway route failed the GitHub/Railway checks.", "همه پروکسی‌های تنظیم‌شده و مسیر مستقیم Railway در بررسی GitHub و Railway ناموفق بودند.", 502);
   error.networkChecks = checks;
   throw error;
+}
+
+async function selectTransport() {
+  const override = Number(globalThis.__LUMEN_TEST_SELECTION_TIMEOUT_MS__);
+  const timeoutMs = Number.isFinite(override) && override > 0 ? override : NETWORK_SELECTION_TIMEOUT_MS;
+  let timer;
+  try {
+    return await Promise.race([
+      selectTransportInternal(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new InstallError(
+          "NETWORK_SCAN_TIMEOUT", "network",
+          "Network route checks exceeded their hard deadline.",
+          "بررسی مسیرهای شبکه از مهلت نهایی عبور کرد.", 504,
+        )), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function fetchWithTimeout(route, url, options, timeoutMs = 18000) {
@@ -383,7 +417,7 @@ async function github(route, token, path, options = {}) {
       Accept: "application/vnd.github+json",
       Authorization: "Bearer " + token,
       "Content-Type": "application/json",
-      "User-Agent": "Lumen-Railway-Installer/22",
+      "User-Agent": "Lumen-Railway-Installer/23",
       "X-GitHub-Api-Version": "2022-11-28",
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
@@ -438,7 +472,7 @@ async function railway(route, token, query, variables, step) {
       Accept: "application/json",
       Authorization: "Bearer " + token,
       "Content-Type": "application/json",
-      "User-Agent": "Lumen-Railway-Installer/22",
+      "User-Agent": "Lumen-Railway-Installer/23",
     },
     body: JSON.stringify({ query, variables }),
   }, 22000);
@@ -691,8 +725,8 @@ html[data-theme="dark"]{
 </header>
 <main class="layout">
  <section class="hero" aria-labelledby="hero-title">
-  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۲" data-en="Public Lumen installer · v22">نصاب عمومی Lumen · نسخه ۲۲</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
-  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v22</span><span class="chip">6 proxies + direct</span></div></div>
+  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۳" data-en="Public Lumen installer · v23">نصاب عمومی Lumen · نسخه ۲۳</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
+  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v23</span><span class="chip">6 proxies + direct</span></div></div>
  </section>
  <section class="panel">
   <div class="view" id="form-view">
@@ -770,7 +804,7 @@ async function refreshDeploymentNetwork() {
         selectedRoute: Object.freeze({
           kind: result.route.kind,
           label: routeLabel(result.route),
-          latencyMs: result.latencyMs,
+          latencyMs: result.selected.latencyMs,
         }),
         checks: Object.freeze(result.checks.map((item) => Object.freeze({ ...item }))),
         error: null,
@@ -891,6 +925,7 @@ export const __test = {
   HTTP_PROXIES,
   PROXY_PROBE_TIMEOUT_MS,
   DIRECT_PROBE_TIMEOUT_MS,
+  NETWORK_SELECTION_TIMEOUT_MS,
   responseIsComplete,
   collectHttpResponse,
   decodeChunked,
@@ -911,7 +946,7 @@ async function start() {
   const port = Number.parseInt(process.env.PORT || "3000", 10);
   const server = createInstallerServer();
   server.listen(port, "0.0.0.0", () => {
-    console.log(`Lumen Railway installer v22 listening on ${port}`);
+    console.log(`Lumen Railway installer v23 listening on ${port}`);
     void refreshDeploymentNetwork();
   });
   const timer = setInterval(() => { void refreshDeploymentNetwork(); }, NETWORK_REFRESH_MS);

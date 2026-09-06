@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 
 /*
- * Lumen public self-contained Railway service installer — v25.0.0
+ * Lumen public self-contained Railway service installer — v26.0.0
  * Every user deploys this folder as a service in their own Railway account.
  * Runs on Node.js 22 with node:net/node:tls.
  * It does not persist submitted tokens and never writes them to logs.
@@ -16,7 +16,7 @@ const SOURCE_REPO = "Lumen-Project-Final";
 const SOURCE_FULL = SOURCE_OWNER + "/" + SOURCE_REPO;
 const GITHUB_API = "https://api.github.com";
 const RAILWAY_API = "https://backboard.railway.com/graphql/v2";
-const INSTALLER_VERSION = "25.0.0";
+const INSTALLER_VERSION = "26.0.0";
 const MAX_BODY_BYTES = 24 * 1024;
 const MAX_UPSTREAM_BYTES = 4 * 1024 * 1024;
 const HTTP_PROXIES = Object.freeze([
@@ -332,7 +332,7 @@ async function probeRoute(route, index) {
   let failureCode = "PROBE_FAILED";
   try {
     const githubResponse = await routeFetch(route, GITHUB_API + "/meta", {
-      method: "GET", headers: { Accept: "application/vnd.github+json", "User-Agent": "Lumen-Network-Probe/25" },
+      method: "GET", headers: { Accept: "application/vnd.github+json", "User-Agent": "Lumen-Network-Probe/26" },
     }, route.kind === "direct" ? DIRECT_PROBE_TIMEOUT_MS : PROXY_PROBE_TIMEOUT_MS);
     if (!githubResponse.ok) throw new Error("GitHub HTTP " + githubResponse.status);
     githubOk = true;
@@ -343,7 +343,7 @@ async function probeRoute(route, index) {
   // parallel, staying within Railway's six simultaneous socket limit.
   try {
     const railwayResponse = await routeFetch(route, RAILWAY_API, {
-      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "Lumen-Network-Probe/25" },
+      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "Lumen-Network-Probe/26" },
       body: JSON.stringify({ query: "query LumenNetworkProbe { __typename }", variables: {} }),
     }, route.kind === "direct" ? DIRECT_PROBE_TIMEOUT_MS : PROXY_PROBE_TIMEOUT_MS);
     if (railwayResponse.status < 200 || railwayResponse.status >= 500) throw new Error("Railway HTTP " + railwayResponse.status);
@@ -470,7 +470,7 @@ async function github(route, token, path, options = {}) {
       Accept: "application/vnd.github+json",
       Authorization: "Bearer " + token,
       "Content-Type": "application/json",
-      "User-Agent": "Lumen-Railway-Installer/25",
+      "User-Agent": "Lumen-Railway-Installer/26",
       "X-GitHub-Api-Version": "2022-11-28",
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
@@ -525,7 +525,7 @@ async function railway(route, token, query, variables, step) {
       Accept: "application/json",
       Authorization: "Bearer " + token,
       "Content-Type": "application/json",
-      "User-Agent": "Lumen-Railway-Installer/25",
+      "User-Agent": "Lumen-Railway-Installer/26",
     },
     body: JSON.stringify({ query, variables }),
   }, 22000);
@@ -556,13 +556,76 @@ async function railway(route, token, query, variables, step) {
   return result.data || {};
 }
 
+function workspaceList(value) {
+  if (Array.isArray(value)) return value;
+  if (value && Array.isArray(value.edges)) return value.edges.map((edge) => edge && edge.node).filter(Boolean);
+  return [];
+}
+
+async function ensureWorkspace(route, railwayToken, ownerLogin) {
+  const workspaceName = ("Lumen " + String(ownerLogin || "Workspace")).slice(0, 48);
+  const listed = await railway(
+    route,
+    railwayToken,
+    "query InstallerWorkspaces { me { workspaces { id name } } }",
+    {},
+    "workspace-list"
+  );
+  const available = workspaceList(listed.me && listed.me.workspaces)
+    .filter((item) => item && typeof item.id === "string" && item.id.length > 0);
+  const existing = available.find((item) => String(item.name || "").toLowerCase() === workspaceName.toLowerCase());
+  if (existing) return { id: existing.id, name: String(existing.name || workspaceName), mode: "reused-lumen" };
+
+  // Workspace creation is not exposed in every Railway public schema. Discover
+  // it at runtime; create a dedicated Lumen workspace when supported, otherwise
+  // reuse the first accessible workspace and still pass its required ID.
+  try {
+    const capability = await railway(
+      route,
+      railwayToken,
+      'query InstallerWorkspaceCapability { __type(name: "Mutation") { fields { name } } }',
+      {},
+      "workspace-capability"
+    );
+    const fields = capability.__type && Array.isArray(capability.__type.fields) ? capability.__type.fields : [];
+    if (fields.some((field) => field && field.name === "workspaceCreate")) {
+      const created = await railway(
+        route,
+        railwayToken,
+        "mutation InstallerWorkspaceCreate($input: WorkspaceCreateInput!) { workspaceCreate(input: $input) { id name } }",
+        { input: { name: workspaceName } },
+        "workspace-create"
+      );
+      const workspace = created.workspaceCreate;
+      if (workspace && typeof workspace.id === "string" && workspace.id) {
+        return { id: workspace.id, name: String(workspace.name || workspaceName), mode: "created" };
+      }
+    }
+  } catch (_) {
+    // A schema without workspaceCreate, or an account plan that disallows new
+    // workspaces, falls back to the account's existing accessible workspace.
+  }
+
+  if (available.length) {
+    const fallback = available[0];
+    return { id: fallback.id, name: String(fallback.name || "Railway Workspace"), mode: "reused-existing" };
+  }
+  throw new InstallError(
+    "WORKSPACE_REQUIRED", "workspace",
+    "No accessible Railway workspace was found and this API account cannot create one. Create a workspace in Railway, then retry with an Account Token.",
+    "هیچ Workspace قابل دسترسی پیدا نشد و API این حساب هم اجازه ساخت آن را نداد. ابتدا در Railway یک Workspace بسازید و سپس با Account Token دوباره تلاش کنید.",
+    409,
+  );
+}
+
 async function provisionRailway(route, railwayToken, githubToken, fork, branch, commitSha, adminPassword) {
+  const workspace = await ensureWorkspace(route, railwayToken, fork.owner.login);
   const projectName = "Lumen " + String(fork.owner.login).slice(0, 20) + " " + new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
   const created = await railway(
     route,
     railwayToken,
     "mutation InstallerProject($input: ProjectCreateInput!) { projectCreate(input: $input) { id name environments { edges { node { id name } } } } }",
-    { input: { name: projectName, description: "Lumen installed by the Railway installer", defaultEnvironmentName: "production" } },
+    { input: { workspaceId: workspace.id, name: projectName, description: "Lumen installed by the Railway installer", defaultEnvironmentName: "production" } },
     "project"
   );
   const project = created.projectCreate;
@@ -670,6 +733,9 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
     }
   }
   return {
+    workspaceId: workspace.id,
+    workspaceName: workspace.name,
+    workspaceMode: workspace.mode,
     panelUrl: "https://" + domain + "/dashboard",
     railwayProjectUrl: "https://railway.com/project/" + encodeURIComponent(project.id),
     projectId: project.id,
@@ -799,8 +865,8 @@ html[data-theme="dark"]{
 </header>
 <main class="layout">
  <section class="hero" aria-labelledby="hero-title">
-  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۵" data-en="Public Lumen installer · v25">نصاب عمومی Lumen · نسخه ۲۵</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
-  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v25</span><span class="chip">6 proxies + direct</span></div></div>
+  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۶" data-en="Public Lumen installer · v26">نصاب عمومی Lumen · نسخه ۲۶</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
+  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v26</span><span class="chip">6 proxies + direct</span></div></div>
  </section>
  <section class="panel">
   <div class="view" id="form-view">
@@ -818,7 +884,7 @@ html[data-theme="dark"]{
    </form>
   </div>
   <div class="view" id="progress-view" hidden aria-live="polite"><div class="progress-head"><div class="spinner" aria-hidden="true"></div><h2 data-fa="ستاپ در حال اجراست" data-en="Setup is running">ستاپ در حال اجراست</h2><p class="muted" data-fa="صفحه را نبندید؛ ساخت فورک و دیپلوی ممکن است چند دقیقه زمان ببرد." data-en="Keep this page open. Fork creation and deployment may take a few minutes.">صفحه را نبندید؛ ساخت فورک و دیپلوی ممکن است چند دقیقه زمان ببرد.</p></div><div class="steps" id="steps"></div></div>
-  <div class="view" id="success-view" hidden aria-live="polite"><div class="success-mark">✓</div><h2 data-fa="پنل آماده شد" data-en="Your panel is ready">پنل آماده شد</h2><p class="muted" id="success-copy"></p><div class="result"><div class="result-row"><div><label data-fa="لینک پنل مدیریت" data-en="Management panel URL">لینک پنل مدیریت</label><code id="panel-url"></code></div><button class="copy" type="button" data-copy="panel-url" aria-label="Copy panel URL">⧉</button></div><div class="result-row"><div><label data-fa="رمز ادمین — فقط همین‌بار نمایش داده می‌شود" data-en="Admin password — shown once">رمز ادمین — فقط همین‌بار نمایش داده می‌شود</label><code id="admin-password"></code></div><button class="copy" type="button" data-copy="admin-password" aria-label="Copy admin password">⧉</button></div><div class="result-row"><div><label data-fa="فورک شما" data-en="Your fork">فو��ک شما</label><code id="fork-repository"></code></div><button class="copy" type="button" data-copy="fork-repository" aria-label="Copy fork repository">⧉</button></div><div class="result-row"><div><label data-fa="مسیر شبکه انتخاب‌شده" data-en="Selected network route">مسیر شبکه انتخاب‌شده</label><code id="network-route"></code></div><button class="copy" type="button" data-copy="network-route" aria-label="Copy selected route">⧉</button></div></div><div class="actions"><a class="filled" id="open-panel" target="_blank" rel="noopener noreferrer" data-fa="باز کردن پنل" data-en="Open panel">باز کردن پنل</a><a class="tonal" id="open-railway" target="_blank" rel="noopener noreferrer" data-fa="نمایش در Railway" data-en="View in Railway">نمایش در Railway</a></div></div>
+  <div class="view" id="success-view" hidden aria-live="polite"><div class="success-mark">✓</div><h2 data-fa="پنل آماده شد" data-en="Your panel is ready">پنل آماده شد</h2><p class="muted" id="success-copy"></p><div class="result"><div class="result-row"><div><label data-fa="لینک پنل مدیریت" data-en="Management panel URL">لینک پنل مدیریت</label><code id="panel-url"></code></div><button class="copy" type="button" data-copy="panel-url" aria-label="Copy panel URL">⧉</button></div><div class="result-row"><div><label data-fa="رمز ادمین — فقط همین‌بار نمایش داده می‌شود" data-en="Admin password — shown once">رمز ادمین — فقط همین‌بار نمایش داده می‌شود</label><code id="admin-password"></code></div><button class="copy" type="button" data-copy="admin-password" aria-label="Copy admin password">⧉</button></div><div class="result-row"><div><label data-fa="فورک شما" data-en="Your fork">فو��ک شما</label><code id="fork-repository"></code></div><button class="copy" type="button" data-copy="fork-repository" aria-label="Copy fork repository">⧉</button></div><div class="result-row"><div><label data-fa="Workspace انتخاب‌شده" data-en="Selected workspace">Workspace انتخاب‌شده</label><code id="workspace-name"></code></div><button class="copy" type="button" data-copy="workspace-name" aria-label="Copy workspace name">⧉</button></div><div class="result-row"><div><label data-fa="مسیر شبکه انتخاب‌شده" data-en="Selected network route">مسیر شبکه انتخاب‌شده</label><code id="network-route"></code></div><button class="copy" type="button" data-copy="network-route" aria-label="Copy selected route">⧉</button></div></div><div class="actions"><a class="filled" id="open-panel" target="_blank" rel="noopener noreferrer" data-fa="باز کردن پنل" data-en="Open panel">باز کردن پنل</a><a class="tonal" id="open-railway" target="_blank" rel="noopener noreferrer" data-fa="نمایش در Railway" data-en="View in Railway">نمایش در Railway</a></div></div>
   <div class="view" id="error-view" hidden aria-live="assertive"><div class="error-mark">!</div><h2 data-fa="نصب متوقف شد" data-en="Setup stopped">نصب متوقف شد</h2><div class="error-box" id="error-message"></div><button class="tonal" id="retry" type="button" data-fa="بازگشت و تلاش دوباره" data-en="Go back and retry">بازگشت و تلاش دوباره</button></div>
  </section>
 </main>
@@ -827,7 +893,7 @@ html[data-theme="dark"]{
 <script nonce="__NONCE__">
 (function(){
  var lang=localStorage.getItem('lumen-installer-lang')||'fa';var theme=localStorage.getItem('lumen-installer-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');var progressTimer=null;
- var stepDefs=[['آزمایش مسیر مستقیم و همه پروکسی‌ها','Test direct egress and all proxies'],['استار کردن سورس رسمی','Star official source'],['ساخت یا بررسی فورک','Create or verify fork'],['ساخت پروژه Railway','Create Railway project'],['تنظیم متغیرها و سرویس','Configure service and variables'],['اتصال فضای دائمی /data','Attach persistent /data'],['ساخت دامنه عمومی','Generate public domain'],['شروع دیپلوی','Start deployment']];
+ var stepDefs=[['آزمایش مسیر مستقیم و همه پروکسی‌ها','Test direct egress and all proxies'],['استار کردن سورس رسمی','Star official source'],['ساخت یا بررسی فورک','Create or verify fork'],['کشف یا ساخت Workspace','Resolve or create workspace'],['ساخت پروژه Railway','Create Railway project'],['تنظیم متغیرها و سرویس','Configure service and variables'],['اتصال فضای دائمی /data','Attach persistent /data'],['ساخت دامنه عمومی','Generate public domain'],['شروع دیپلوی','Start deployment']];
  function applyLocale(){document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-fa]').forEach(function(el){el.textContent=el.getAttribute(lang==='fa'?'data-fa':'data-en')});document.querySelector('.lang-text').textContent=lang==='fa'?'EN':'فا';renderSteps(window.__activeStep||0)}
  function applyTheme(){document.documentElement.setAttribute('data-theme',theme)}
  function show(id){['form-view','progress-view','success-view','error-view'].forEach(function(name){document.getElementById(name).hidden=name!==id})}
@@ -837,7 +903,7 @@ html[data-theme="dark"]{
  document.querySelectorAll('[data-reveal]').forEach(function(button){button.addEventListener('click',function(){var input=document.getElementById(button.getAttribute('data-reveal'));input.type=input.type==='password'?'text':'password'})});
  document.querySelectorAll('[data-copy]').forEach(function(button){button.addEventListener('click',function(){var text=document.getElementById(button.getAttribute('data-copy')).textContent;navigator.clipboard.writeText(text).then(function(){button.textContent='✓';setTimeout(function(){button.textContent='⧉'},1200)})})});
  document.getElementById('retry').addEventListener('click',function(){show('form-view')});
- document.getElementById('install-form').addEventListener('submit',async function(event){event.preventDefault();var ghInput=document.getElementById('github-token'),rwInput=document.getElementById('railway-token');var gh=ghInput.value.trim(),rw=rwInput.value.trim();if(gh.length<20||rw.length<20){document.getElementById('error-message').textContent=lang==='fa'?'هر دو توکن را کامل وارد کنید.':'Enter both complete tokens.';show('error-view');return}ghInput.value='';rwInput.value='';show('progress-view');window.__activeStep=0;renderSteps(0);progressTimer=setInterval(function(){if(window.__activeStep<7){window.__activeStep+=1;renderSteps(window.__activeStep)}},3500);try{var response=await fetch('/api/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({githubToken:gh,railwayToken:rw}),cache:'no-store',credentials:'same-origin'});gh='';rw='';var data=await response.json();clearInterval(progressTimer);if(!response.ok||!data.ok)throw data;window.__activeStep=8;renderSteps(8);document.getElementById('panel-url').textContent=data.panelUrl;document.getElementById('admin-password').textContent=data.adminPassword;document.getElementById('fork-repository').textContent=data.forkRepository;document.getElementById('network-route').textContent=(data.networkRoute&&data.networkRoute.label)||'—';document.getElementById('open-panel').href=data.panelUrl;document.getElementById('open-railway').href=data.railwayProjectUrl;document.getElementById('success-copy').textContent=lang==='fa'?'دیپلوی شروع شده است. اگر پنل فوراً باز نشد، ۱ تا ۳ دقیقه صبر کنید. رمز ادمین را همین حالا ذخیره کنید.':'Deployment has started. If the panel is not ready yet, wait 1–3 minutes. Save the admin password now.';show('success-view')}catch(error){clearInterval(progressTimer);gh='';rw='';var detail=error&&error.error?error.error:null;var base=detail?(lang==='fa'?detail.messageFa:detail.messageEn):(lang==='fa'?'پاسخ نامعتبر از نصاب دریافت شد.':'The installer returned an invalid response.');var meta=detail?' ['+(detail.step||'unknown')+' / '+(detail.code||'UNKNOWN')+(detail.requestId?' / '+detail.requestId:'')+']':'';var extra=detail&&detail.details?' '+detail.details:'';document.getElementById('error-message').textContent=base+extra+meta;show('error-view')}});
+ document.getElementById('install-form').addEventListener('submit',async function(event){event.preventDefault();var ghInput=document.getElementById('github-token'),rwInput=document.getElementById('railway-token');var gh=ghInput.value.trim(),rw=rwInput.value.trim();if(gh.length<20||rw.length<20){document.getElementById('error-message').textContent=lang==='fa'?'هر دو توکن را کامل وارد کنید.':'Enter both complete tokens.';show('error-view');return}ghInput.value='';rwInput.value='';show('progress-view');window.__activeStep=0;renderSteps(0);progressTimer=setInterval(function(){if(window.__activeStep<stepDefs.length-1){window.__activeStep+=1;renderSteps(window.__activeStep)}},3500);try{var response=await fetch('/api/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({githubToken:gh,railwayToken:rw}),cache:'no-store',credentials:'same-origin'});gh='';rw='';var data=await response.json();clearInterval(progressTimer);if(!response.ok||!data.ok)throw data;window.__activeStep=stepDefs.length;renderSteps(stepDefs.length);document.getElementById('panel-url').textContent=data.panelUrl;document.getElementById('admin-password').textContent=data.adminPassword;document.getElementById('fork-repository').textContent=data.forkRepository;document.getElementById('workspace-name').textContent=(data.workspaceName||'—')+' · '+(data.workspaceMode||'');document.getElementById('network-route').textContent=(data.networkRoute&&data.networkRoute.label)||'—';document.getElementById('open-panel').href=data.panelUrl;document.getElementById('open-railway').href=data.railwayProjectUrl;document.getElementById('success-copy').textContent=lang==='fa'?'دیپلوی شروع شده است. اگر پنل فوراً باز نشد، ۱ تا ۳ دقیقه صبر کنید. رمز ادمین را همین حالا ذخیره کنید.':'Deployment has started. If the panel is not ready yet, wait 1–3 minutes. Save the admin password now.';show('success-view')}catch(error){clearInterval(progressTimer);gh='';rw='';var detail=error&&error.error?error.error:null;var base=detail?(lang==='fa'?detail.messageFa:detail.messageEn):(lang==='fa'?'پاسخ نامعتبر از نصاب دریافت شد.':'The installer returned an invalid response.');var meta=detail?' ['+(detail.step||'unknown')+' / '+(detail.code||'UNKNOWN')+(detail.requestId?' / '+detail.requestId:'')+']':'';var extra=detail&&detail.details?' '+detail.details:'';document.getElementById('error-message').textContent=base+extra+meta;show('error-view')}});
  applyTheme();applyLocale();show('form-view');
 })();
 </script>
@@ -1019,6 +1085,7 @@ export const __test = {
   probeRoute,
   selectTransport,
   selectAuthenticatedTransport,
+  ensureWorkspace,
   routeLabel,
   refreshDeploymentNetwork,
   publicNetworkState,
@@ -1029,7 +1096,7 @@ async function start() {
   const port = Number.parseInt(process.env.PORT || "3000", 10);
   const server = createInstallerServer();
   server.listen(port, "0.0.0.0", () => {
-    console.log(`Lumen Railway installer v25 listening on ${port}`);
+    console.log(`Lumen Railway installer v26 listening on ${port}`);
     void refreshDeploymentNetwork();
   });
   const timer = setInterval(() => { void refreshDeploymentNetwork(); }, NETWORK_REFRESH_MS);

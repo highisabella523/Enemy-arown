@@ -1,4 +1,4 @@
-# Lumen Railway Installer v25
+# Lumen Railway Installer v26
 
 Standalone public installer hosted on Railway. This folder contains the complete deployable service.
 

@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 
 /*
- * Lumen public self-contained Railway service installer — v23.0.0
+ * Lumen public self-contained Railway service installer — v24.0.0
  * Every user deploys this folder as a service in their own Railway account.
  * Runs on Node.js 22 with node:net/node:tls.
  * It does not persist submitted tokens and never writes them to logs.
@@ -16,7 +16,7 @@ const SOURCE_REPO = "Lumen-Project-Final";
 const SOURCE_FULL = SOURCE_OWNER + "/" + SOURCE_REPO;
 const GITHUB_API = "https://api.github.com";
 const RAILWAY_API = "https://backboard.railway.com/graphql/v2";
-const INSTALLER_VERSION = "23.0.0";
+const INSTALLER_VERSION = "24.0.0";
 const MAX_BODY_BYTES = 24 * 1024;
 const MAX_UPSTREAM_BYTES = 4 * 1024 * 1024;
 const HTTP_PROXIES = Object.freeze([
@@ -332,7 +332,7 @@ async function probeRoute(route, index) {
   let failureCode = "PROBE_FAILED";
   try {
     const githubResponse = await routeFetch(route, GITHUB_API + "/meta", {
-      method: "GET", headers: { Accept: "application/vnd.github+json", "User-Agent": "Lumen-Network-Probe/23" },
+      method: "GET", headers: { Accept: "application/vnd.github+json", "User-Agent": "Lumen-Network-Probe/24" },
     }, route.kind === "direct" ? DIRECT_PROBE_TIMEOUT_MS : PROXY_PROBE_TIMEOUT_MS);
     if (!githubResponse.ok) throw new Error("GitHub HTTP " + githubResponse.status);
     githubOk = true;
@@ -343,7 +343,7 @@ async function probeRoute(route, index) {
   // parallel, staying within Railway's six simultaneous socket limit.
   try {
     const railwayResponse = await routeFetch(route, RAILWAY_API, {
-      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "Lumen-Network-Probe/23" },
+      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "Lumen-Network-Probe/24" },
       body: JSON.stringify({ query: "query LumenNetworkProbe { __typename }", variables: {} }),
     }, route.kind === "direct" ? DIRECT_PROBE_TIMEOUT_MS : PROXY_PROBE_TIMEOUT_MS);
     if (railwayResponse.status < 200 || railwayResponse.status >= 500) throw new Error("Railway HTTP " + railwayResponse.status);
@@ -403,6 +403,69 @@ async function fetchWithTimeout(route, url, options, timeoutMs = 18000) {
   return routeFetch(route, url, options, timeoutMs);
 }
 
+function routeFailureSummary(route, error) {
+  return {
+    label: routeLabel(route),
+    code: error instanceof InstallError ? error.code : "ROUTE_AUTH_FAILED",
+    step: error instanceof InstallError ? error.step : "network",
+  };
+}
+
+async function selectAuthenticatedTransport(network, githubToken, railwayToken) {
+  const proxyCandidates = network.checks
+    .filter((item) => item.ok && item.route && item.route.kind === "proxy")
+    .sort((left, right) => left.latencyMs - right.latencyMs || left.index - right.index);
+  const attempts = [];
+  const credentialErrors = [];
+  let checks = [...network.checks];
+
+  const validate = async (candidate) => {
+    const route = candidate.route;
+    try {
+      const identity = await github(route, githubToken, "/user", { step: "github-token" });
+      await railway(route, railwayToken, "query InstallerIdentity { me { id name email } }", {}, "railway-token");
+      return { route, selected: candidate, identity, checks, authChecks: [...attempts, { label: routeLabel(route), ok: true }] };
+    } catch (error) {
+      attempts.push({ ...routeFailureSummary(route, error), ok: false });
+      if (error instanceof InstallError && ["GITHUB_TOKEN_INVALID", "GITHUB_PERMISSION", "RAILWAY_TOKEN_INVALID"].includes(error.code)) credentialErrors.push(error);
+      return null;
+    }
+  };
+
+  // A public probe can pass while a proxy blocks Authorization headers or
+  // selected API operations. Qualify routes with both real account tokens
+  // before creating any GitHub fork or Railway resource.
+  for (const candidate of proxyCandidates) {
+    const accepted = await validate(candidate);
+    if (accepted) return accepted;
+  }
+
+  // If public proxy probes passed but authenticated operations did not, test
+  // direct Railway egress as the final safe fallback before making mutations.
+  let directCandidate = checks.find((item) => item.route && item.route.kind === "direct");
+  if (!directCandidate) {
+    directCandidate = await probeRoute({ kind: "direct" }, HTTP_PROXIES.length);
+    checks = [...checks, directCandidate];
+  }
+  if (directCandidate.ok) {
+    const accepted = await validate(directCandidate);
+    if (accepted) return accepted;
+  }
+
+  const allCodes = credentialErrors.map((error) => error.code);
+  if (allCodes.length && allCodes.every((code) => code === "GITHUB_TOKEN_INVALID")) throw credentialErrors[0];
+  if (allCodes.length && allCodes.every((code) => code === "GITHUB_PERMISSION")) throw credentialErrors[0];
+  if (allCodes.length && allCodes.every((code) => code === "RAILWAY_TOKEN_INVALID")) throw credentialErrors[0];
+  const error = new InstallError(
+    "NO_AUTHENTICATED_ROUTE", "network-auth",
+    "No route could complete authenticated GitHub and Railway checks. Review /api/network and retry.",
+    "هیچ مسیری نتوانست بررسی احراز هویت GitHub و Railway را کامل کند. وضعیت /api/network را ببینید و دوباره تلاش کنید.",
+    502,
+  );
+  error.routeAttempts = attempts;
+  throw error;
+}
+
 function githubError(status, step) {
   if (status === 401) return new InstallError("GITHUB_TOKEN_INVALID", step, "The GitHub token is invalid or expired.", "توکن GitHub نامعتبر یا منقضی است.", 401);
   if (status === 403) return new InstallError("GITHUB_PERMISSION", step, "GitHub denied this action. Create a classic token with the public_repo scope and check rate limits.", "GitHub این عملیات را رد کرد. توکن کلاسیک را با دسترسی public_repo بسازید و محدودیت درخواست را بررسی کنید.", 403);
@@ -417,7 +480,7 @@ async function github(route, token, path, options = {}) {
       Accept: "application/vnd.github+json",
       Authorization: "Bearer " + token,
       "Content-Type": "application/json",
-      "User-Agent": "Lumen-Railway-Installer/23",
+      "User-Agent": "Lumen-Railway-Installer/24",
       "X-GitHub-Api-Version": "2022-11-28",
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
@@ -472,7 +535,7 @@ async function railway(route, token, query, variables, step) {
       Accept: "application/json",
       Authorization: "Bearer " + token,
       "Content-Type": "application/json",
-      "User-Agent": "Lumen-Railway-Installer/23",
+      "User-Agent": "Lumen-Railway-Installer/24",
     },
     body: JSON.stringify({ query, variables }),
   }, 22000);
@@ -484,27 +547,30 @@ async function railway(route, token, query, variables, step) {
     throw new InstallError("RAILWAY_RESPONSE", step, "Railway returned an unreadable response.", "پاسخ Railway قابل خواندن نبود.", 502);
   }
   if (Array.isArray(result.errors) && result.errors.length) {
-    const messages = result.errors.map((item) => String(item && item.message ? item.message : "")).join(" ").toLowerCase();
+    const rawMessages = result.errors.map((item) => String(item && item.message ? item.message : "Railway request failed"));
+    const safeDetails = rawMessages.join(" | ").replaceAll(token, "[redacted]").replace(/[\r\n\0]+/g, " ").slice(0, 360);
+    const messages = safeDetails.toLowerCase();
+    let error;
     if (messages.includes("github") || messages.includes("repository") || messages.includes("repo")) {
-      throw new InstallError("RAILWAY_GITHUB_NOT_CONNECTED", step, "Railway cannot access the fork. Connect GitHub in Railway Account → Integrations, grant access to the fork, then retry.", "Railway به فورک دسترسی ندارد. در Railway از Account ← Integrations، گیت‌هاب را متصل و دسترسی فورک را فعال کنید، سپس دوباره تلاش کنید.", 409);
+      error = new InstallError("RAILWAY_GITHUB_NOT_CONNECTED", step, "Railway cannot access the fork. Connect GitHub in Railway Account → Integrations, grant access to the fork, then retry.", "Railway به فورک دسترسی ندارد. در Railway از Account ← Integrations، گیت‌هاب را متصل و دسترسی فورک را فعال کنید، سپس دوباره تلاش کنید.", 409);
+    } else if (messages.includes("limit") || messages.includes("plan") || messages.includes("volume")) {
+      error = new InstallError("RAILWAY_PLAN_LIMIT", step, "A Railway plan or resource limit blocked this step. Check your account usage and project limits.", "محدودیت پلن یا منابع Railway مانع این مرحله شد. مصرف حساب و محدودیت‌های پروژه را بررسی کنید.", 409);
+    } else {
+      error = new InstallError("RAILWAY_GRAPHQL_ERROR", step, "Railway rejected the " + step + " step.", "Railway مرحله «" + step + "» را رد کرد.", 502);
     }
-    if (messages.includes("limit") || messages.includes("plan") || messages.includes("volume")) {
-      throw new InstallError("RAILWAY_PLAN_LIMIT", step, "A Railway plan or resource limit blocked this step. Check your account usage and project limits.", "محدودیت پلن یا منابع Railway مانع این مرحله شد. مصرف حساب و محدودیت‌های پروژه را بررسی کنید.", 409);
-    }
-    throw new InstallError("RAILWAY_GRAPHQL_ERROR", step, "Railway rejected the " + step + " step. Check account access and try again.", "Railway مرحله «" + step + "» را رد کرد. دسترسی حساب را بررسی و دوباره تلاش کنید.", 502);
+    error.safeDetails = safeDetails;
+    throw error;
   }
   return result.data || {};
 }
 
-async function provisionRailway(route, railwayToken, githubToken, fork, branch, adminPassword) {
-  await railway(route, railwayToken, "query InstallerIdentity { me { id name email } }", {}, "railway-token");
-
-  const projectName = "Lumen " + String(fork.owner.login).slice(0, 20) + " " + new Date().toISOString().slice(0, 10);
+async function provisionRailway(route, railwayToken, githubToken, fork, branch, commitSha, adminPassword) {
+  const projectName = "Lumen " + String(fork.owner.login).slice(0, 20) + " " + new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
   const created = await railway(
     route,
     railwayToken,
     "mutation InstallerProject($input: ProjectCreateInput!) { projectCreate(input: $input) { id name environments { edges { node { id name } } } } }",
-    { input: { name: projectName, description: "Lumen installed by the public one-file Railway setup", defaultEnvironmentName: "production", prDeploys: false } },
+    { input: { name: projectName, description: "Lumen installed by the Railway installer", defaultEnvironmentName: "production" } },
     "project"
   );
   const project = created.projectCreate;
@@ -515,35 +581,20 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
     const loaded = await railway(
       route,
       railwayToken,
-      "query InstallerProjectEnvironment($id: String!) { project(id: $id) { environments { edges { node { id name } } } } }",
-      { id: project.id },
+      "query InstallerProjectEnvironment($projectId: String!, $isEphemeral: Boolean) { environments(projectId: $projectId, isEphemeral: $isEphemeral) { edges { node { id name } } } }",
+      { projectId: project.id, isEphemeral: false },
       "environment"
     );
-    environment = loaded.project && loaded.project.environments && loaded.project.environments.edges && loaded.project.environments.edges[0] ? loaded.project.environments.edges[0].node : null;
+    environment = loaded.environments && loaded.environments.edges && loaded.environments.edges[0] ? loaded.environments.edges[0].node : null;
   }
   if (!environment || !environment.id) throw new InstallError("ENVIRONMENT_MISSING", "environment", "Railway did not create the production environment.", "Railway محیط production را ایجاد نکرد.", 502);
 
-  const variables = {
-    ADMIN_PASSWORD: adminPassword,
-    SECRET_KEY: randomSecret(48),
-    DATA_DIR: "/data",
-    PYTHONUNBUFFERED: "1",
-    PROXY_REPOSITORY_MANUAL_REFRESH_KEY: randomSecret(36),
-    LUMEN_UPSTREAM_REPO: SOURCE_FULL,
-    LUMEN_FORK_REPO: String(fork.full_name),
-    LUMEN_GITHUB_TOKEN: githubToken,
-    LUMEN_RAILWAY_TOKEN: railwayToken,
-    RAILWAY_GIT_BRANCH: branch,
-    LUMEN_INSTALLER_VERSION: INSTALLER_VERSION,
-    LUMEN_CREDENTIAL_SOURCE: "installer",
-    LUMEN_REQUIRE_PERSISTENT_STORAGE: "1",
-  };
-
+  // Create an empty service first, then configure it before connecting the source.
   const serviceResult = await railway(
     route,
     railwayToken,
     "mutation InstallerService($input: ServiceCreateInput!) { serviceCreate(input: $input) { id name } }",
-    { input: { projectId: project.id, name: "Lumen", source: { repo: String(fork.full_name) }, branch, variables, skipInitialDeploys: true } },
+    { input: { projectId: project.id, environmentId: environment.id, name: "Lumen" } },
     "service"
   );
   const service = serviceResult.serviceCreate;
@@ -557,6 +608,30 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
     "service-settings"
   );
 
+  const variables = {
+    ADMIN_PASSWORD: adminPassword,
+    SECRET_KEY: randomSecret(48),
+    DATA_DIR: "/data",
+    PORT: "8000",
+    PYTHONUNBUFFERED: "1",
+    PROXY_REPOSITORY_MANUAL_REFRESH_KEY: randomSecret(36),
+    LUMEN_UPSTREAM_REPO: SOURCE_FULL,
+    LUMEN_FORK_REPO: String(fork.full_name),
+    LUMEN_GITHUB_TOKEN: githubToken,
+    LUMEN_RAILWAY_TOKEN: railwayToken,
+    RAILWAY_GIT_BRANCH: branch,
+    LUMEN_INSTALLER_VERSION: INSTALLER_VERSION,
+    LUMEN_CREDENTIAL_SOURCE: "installer",
+    LUMEN_REQUIRE_PERSISTENT_STORAGE: "1",
+  };
+  await railway(
+    route,
+    railwayToken,
+    "mutation InstallerVariables($input: VariableCollectionUpsertInput!) { variableCollectionUpsert(input: $input) }",
+    { input: { projectId: project.id, environmentId: environment.id, serviceId: service.id, variables, skipDeploys: true } },
+    "variables"
+  );
+
   await railway(
     route,
     railwayToken,
@@ -568,18 +643,26 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
   const domainResult = await railway(
     route,
     railwayToken,
-    "mutation InstallerDomain($input: ServiceDomainCreateInput!) { serviceDomainCreate(input: $input) { domain } }",
+    "mutation InstallerDomain($input: ServiceDomainCreateInput!) { serviceDomainCreate(input: $input) { id domain } }",
     { input: { serviceId: service.id, environmentId: environment.id, targetPort: 8000 } },
     "domain"
   );
   const domain = domainResult.serviceDomainCreate && domainResult.serviceDomainCreate.domain ? String(domainResult.serviceDomainCreate.domain) : "";
   if (!/^[a-z0-9.-]+$/i.test(domain)) throw new InstallError("DOMAIN_CREATE_FAILED", "domain", "Railway did not return a valid public domain.", "Railway دامنه عمومی معتبری برنگرداند.", 502);
 
+  await railway(
+    route,
+    railwayToken,
+    "mutation InstallerSource($id: String!, $input: ServiceConnectInput!) { serviceConnect(id: $id, input: $input) { id } }",
+    { id: service.id, input: { repo: String(fork.full_name), branch } },
+    "source"
+  );
+
   const deployResult = await railway(
     route,
     railwayToken,
-    "mutation InstallerDeploy($serviceId: String!, $environmentId: String!) { serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId) }",
-    { serviceId: service.id, environmentId: environment.id },
+    "mutation InstallerDeploy($serviceId: String!, $environmentId: String!, $commitSha: String!) { serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId, commitSha: $commitSha) }",
+    { serviceId: service.id, environmentId: environment.id, commitSha },
     "deploy"
   );
   const deploymentId = String(deployResult.serviceInstanceDeployV2 || "");
@@ -591,12 +674,9 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
         const checked = await railway(route, railwayToken, "query InstallerDeployment($id: String!) { deployment(id: $id) { id status } }", { id: deploymentId }, "deployment-status");
         deploymentStatus = checked.deployment && checked.deployment.status ? String(checked.deployment.status) : deploymentStatus;
         if (["SUCCESS", "FAILED", "CRASHED"].includes(deploymentStatus)) break;
-      } catch (_) {
-        break;
-      }
+      } catch (_) { break; }
     }
   }
-
   return {
     panelUrl: "https://" + domain + "/dashboard",
     railwayProjectUrl: "https://railway.com/project/" + encodeURIComponent(project.id),
@@ -621,9 +701,10 @@ async function installPayload(payload) {
   let githubToken = validateTokenShape(payload && payload.githubToken, "github");
   let railwayToken = validateTokenShape(payload && payload.railwayToken, "railway");
   try {
-    const network = await selectTransport();
+    const publicNetwork = await selectTransport();
+    const network = await selectAuthenticatedTransport(publicNetwork, githubToken, railwayToken);
     const route = network.route;
-    const identity = await github(route, githubToken, "/user", { step: "github-token" });
+    const identity = network.identity;
     const login = identity && identity.login ? String(identity.login) : "";
     if (!/^[A-Za-z0-9-]{1,39}$/.test(login)) throw new InstallError("GITHUB_IDENTITY", "github-token", "GitHub did not return a valid account.", "GitHub حساب معتبری برنگرداند.", 502);
 
@@ -634,7 +715,7 @@ async function installPayload(payload) {
     if (!commit || !/^[0-9a-f]{40}$/i.test(String(commit.sha || ""))) throw new InstallError("FORK_COMMIT", "fork", "The fork has no deployable branch commit yet.", "فورک هنوز کامیت قابل دیپلوی ندارد.", 502);
 
     const adminPassword = randomSecret(18);
-    const railwayResult = await provisionRailway(route, railwayToken, githubToken, fork, branch, adminPassword);
+    const railwayResult = await provisionRailway(route, railwayToken, githubToken, fork, branch, String(commit.sha), adminPassword);
     return {
       ok: true,
       installerVersion: INSTALLER_VERSION,
@@ -645,6 +726,7 @@ async function installPayload(payload) {
       adminPassword,
       networkRoute: { kind: route.kind, label: routeLabel(route), latencyMs: network.selected.latencyMs },
       networkChecks: network.checks.map((item) => ({ label: item.label, ok: item.ok, latencyMs: item.latencyMs, code: item.ok ? undefined : item.code })),
+      authenticatedRouteChecks: network.authChecks,
       ...railwayResult,
     };
   } finally {
@@ -725,8 +807,8 @@ html[data-theme="dark"]{
 </header>
 <main class="layout">
  <section class="hero" aria-labelledby="hero-title">
-  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۳" data-en="Public Lumen installer · v23">نصاب عمومی Lumen · نسخه ۲۳</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
-  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v23</span><span class="chip">6 proxies + direct</span></div></div>
+  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۴" data-en="Public Lumen installer · v24">نصاب عمومی Lumen · نسخه ۲۴</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
+  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v24</span><span class="chip">6 proxies + direct</span></div></div>
  </section>
  <section class="panel">
   <div class="view" id="form-view">
@@ -739,7 +821,7 @@ html[data-theme="dark"]{
      <div class="guide-row"><div class="guide-icon">2</div><div class="guide-copy"><b data-fa="Account Token ریلوی را بسازید" data-en="Create Railway Account Token">Account Token ریلوی را بسازید</b><span data-fa="از صفحه Tokens در تنظیمات حساب" data-en="From the Tokens page in account settings">از صفحه Tokens در تنظیمات حساب</span></div><a href="https://railway.com/account/tokens" target="_blank" rel="noopener noreferrer" aria-label="Open Railway token page">↗</a></div>
      <div class="guide-row"><div class="guide-icon">3</div><div class="guide-copy"><b data-fa="GitHub را به Railway متصل کنید" data-en="Connect GitHub to Railway">GitHub را به Railway متصل کنید</b><span data-fa="اجازه دسترسی به فورک Lumen را بدهید" data-en="Grant Railway access to the Lumen fork">اجازه دسترسی به فورک Lumen را بدهید</span></div><a href="https://railway.com/account/integrations" target="_blank" rel="noopener noreferrer" aria-label="Open Railway integrations">↗</a></div>
     </div>
-    <div class="notice"><span aria-hidden="true">◆</span><span data-fa="این فایل برای استفاده عمومی است، اما هر شخص باید نسخه خودش را در حساب Railway خودش دیپلوی کند. ابتدا هر شش پروکسی روی همان سرویس Railway آزمایش می‌شوند؛ سریع‌ترین مسیر سالم انتخاب می‌شود و فقط اگر همه ناموفق باشند اتصال مستقیم بررسی می‌شود. هرگز توکن را در نصب‌کننده متعلق به شخص دیگری وارد نکنید." data-en="This file is public, but every user must deploy a personal copy in their own Railway account. All six proxies are tested by the running Railway service; the fastest healthy route is selected, and direct egress is tested only if every proxy fails. Never enter tokens into another person's installer.">این فایل برای استفاده عمومی است، اما هر شخص باید نسخه خودش را در حساب Railway خودش دیپلوی کند. ابتدا هر شش پروکسی روی همان سرویس Railway آزمایش می‌شوند؛ سریع‌ترین مسیر سالم انتخاب می‌شود و فقط اگر همه ناموفق باشند اتصال مستقیم بررسی می‌شود. هرگز توکن را در نصب‌کننده متعلق به شخص دیگری وارد نکنید.</span></div>
+    <div class="notice"><span aria-hidden="true">◆</span><span data-fa="این فایل برای استفاده عمومی است، اما هر شخص باید نسخه خودش را در حساب Railway خودش دیپلوی کند. ابتدا هر شش پروکسی روی همان سرویس Railway آزمایش می‌شوند؛ سریع‌ترین مسیر سالم انتخاب می���شود و فقط اگر همه ناموفق باشند اتصال مستقیم بررسی می‌شود. هرگز توکن را در نصب‌کننده متعلق به شخص دیگری وارد نکنید." data-en="This file is public, but every user must deploy a personal copy in their own Railway account. All six proxies are tested by the running Railway service; the fastest healthy route is selected, and direct egress is tested only if every proxy fails. Never enter tokens into another person's installer.">این فایل برای استفاده عمومی است، اما هر شخص باید نسخه خودش را در حساب Railway خودش دیپلوی کند. ابتدا هر شش پروکسی روی همان سرویس Railway آزمایش می‌شوند؛ سریع‌ترین مسیر سالم انتخاب می‌شود و فقط اگر همه ناموفق باشند اتصال مستقیم بررسی می‌شود. هرگز توکن را در نصب‌کننده متعلق به شخص دیگری وارد نکنید.</span></div>
     <button class="filled" id="install-button" type="submit"><span aria-hidden="true">✦</span><span data-fa="شروع نصب خودکار" data-en="Start automated setup">شروع نصب خودکار</span></button>
    </form>
   </div>
@@ -763,7 +845,7 @@ html[data-theme="dark"]{
  document.querySelectorAll('[data-reveal]').forEach(function(button){button.addEventListener('click',function(){var input=document.getElementById(button.getAttribute('data-reveal'));input.type=input.type==='password'?'text':'password'})});
  document.querySelectorAll('[data-copy]').forEach(function(button){button.addEventListener('click',function(){var text=document.getElementById(button.getAttribute('data-copy')).textContent;navigator.clipboard.writeText(text).then(function(){button.textContent='✓';setTimeout(function(){button.textContent='⧉'},1200)})})});
  document.getElementById('retry').addEventListener('click',function(){show('form-view')});
- document.getElementById('install-form').addEventListener('submit',async function(event){event.preventDefault();var ghInput=document.getElementById('github-token'),rwInput=document.getElementById('railway-token');var gh=ghInput.value.trim(),rw=rwInput.value.trim();if(gh.length<20||rw.length<20){document.getElementById('error-message').textContent=lang==='fa'?'هر دو توکن را کامل وارد کنید.':'Enter both complete tokens.';show('error-view');return}ghInput.value='';rwInput.value='';show('progress-view');window.__activeStep=0;renderSteps(0);progressTimer=setInterval(function(){if(window.__activeStep<7){window.__activeStep+=1;renderSteps(window.__activeStep)}},3500);try{var response=await fetch('/api/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({githubToken:gh,railwayToken:rw}),cache:'no-store',credentials:'same-origin'});gh='';rw='';var data=await response.json();clearInterval(progressTimer);if(!response.ok||!data.ok)throw data;window.__activeStep=8;renderSteps(8);document.getElementById('panel-url').textContent=data.panelUrl;document.getElementById('admin-password').textContent=data.adminPassword;document.getElementById('fork-repository').textContent=data.forkRepository;document.getElementById('network-route').textContent=(data.networkRoute&&data.networkRoute.label)||'—';document.getElementById('open-panel').href=data.panelUrl;document.getElementById('open-railway').href=data.railwayProjectUrl;document.getElementById('success-copy').textContent=lang==='fa'?'دیپلوی شروع شده است. اگر پنل فوراً باز نشد، ۱ تا ۳ دقیقه صبر کنید. رمز ادمین را همین حالا ذخیره کنید.':'Deployment has started. If the panel is not ready yet, wait 1–3 minutes. Save the admin password now.';show('success-view')}catch(error){clearInterval(progressTimer);gh='';rw='';var detail=error&&error.error?error.error:null;document.getElementById('error-message').textContent=detail?(lang==='fa'?detail.messageFa:detail.messageEn):(lang==='fa'?'خطای شبکه رخ داد. اتصال را بررسی کنید و دوباره تلاش کنید.':'A network error occurred. Check your connection and retry.');show('error-view')}});
+ document.getElementById('install-form').addEventListener('submit',async function(event){event.preventDefault();var ghInput=document.getElementById('github-token'),rwInput=document.getElementById('railway-token');var gh=ghInput.value.trim(),rw=rwInput.value.trim();if(gh.length<20||rw.length<20){document.getElementById('error-message').textContent=lang==='fa'?'هر دو توکن را کامل وارد کنید.':'Enter both complete tokens.';show('error-view');return}ghInput.value='';rwInput.value='';show('progress-view');window.__activeStep=0;renderSteps(0);progressTimer=setInterval(function(){if(window.__activeStep<7){window.__activeStep+=1;renderSteps(window.__activeStep)}},3500);try{var response=await fetch('/api/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({githubToken:gh,railwayToken:rw}),cache:'no-store',credentials:'same-origin'});gh='';rw='';var data=await response.json();clearInterval(progressTimer);if(!response.ok||!data.ok)throw data;window.__activeStep=8;renderSteps(8);document.getElementById('panel-url').textContent=data.panelUrl;document.getElementById('admin-password').textContent=data.adminPassword;document.getElementById('fork-repository').textContent=data.forkRepository;document.getElementById('network-route').textContent=(data.networkRoute&&data.networkRoute.label)||'—';document.getElementById('open-panel').href=data.panelUrl;document.getElementById('open-railway').href=data.railwayProjectUrl;document.getElementById('success-copy').textContent=lang==='fa'?'دیپلوی شروع شده است. اگر پنل فوراً باز نشد، ۱ تا ۳ دقیقه صبر کنید. رمز ادمین را همین حالا ذخیره کنید.':'Deployment has started. If the panel is not ready yet, wait 1–3 minutes. Save the admin password now.';show('success-view')}catch(error){clearInterval(progressTimer);gh='';rw='';var detail=error&&error.error?error.error:null;var base=detail?(lang==='fa'?detail.messageFa:detail.messageEn):(lang==='fa'?'پاسخ نامعتبر از نصاب دریافت شد.':'The installer returned an invalid response.');var meta=detail?' ['+(detail.step||'unknown')+' / '+(detail.code||'UNKNOWN')+(detail.requestId?' / '+detail.requestId:'')+']':'';var extra=detail&&detail.details?' '+detail.details:'';document.getElementById('error-message').textContent=base+extra+meta;show('error-view')}});
  applyTheme();applyLocale();show('form-view');
 })();
 </script>
@@ -905,11 +987,19 @@ async function nodeHandler(req, res) {
     }
     return sendJson(res, 404, { ok: false, code: "NOT_FOUND", message: "Not found" });
   } catch (error) {
-    return sendJson(res, error instanceof InstallError ? error.status : 500, {
-      ok: false,
-      code: error instanceof InstallError ? error.code : "INTERNAL_ERROR",
-      message: safeMessage(error),
-    });
+    const requestId = randomSecret(9);
+    const known = error instanceof InstallError;
+    const detail = {
+      code: known ? error.code : "INTERNAL_ERROR",
+      step: known ? error.step : "internal",
+      messageEn: known ? error.messageEn : "The installer encountered an internal error.",
+      messageFa: known ? error.messageFa : "نصاب با یک خطای داخلی روبه‌رو شد.",
+      details: known && error.safeDetails ? error.safeDetails : undefined,
+      routeAttempts: known && error.routeAttempts ? error.routeAttempts : undefined,
+      requestId,
+    };
+    console.error(`[install:${requestId}] code=${detail.code} step=${detail.step}` + (detail.details ? ` details=${detail.details}` : ""));
+    return sendJson(res, known ? error.status : 500, { ok: false, error: detail });
   }
 }
 
@@ -936,6 +1026,7 @@ export const __test = {
   routeFetch,
   probeRoute,
   selectTransport,
+  selectAuthenticatedTransport,
   routeLabel,
   refreshDeploymentNetwork,
   publicNetworkState,
@@ -946,7 +1037,7 @@ async function start() {
   const port = Number.parseInt(process.env.PORT || "3000", 10);
   const server = createInstallerServer();
   server.listen(port, "0.0.0.0", () => {
-    console.log(`Lumen Railway installer v23 listening on ${port}`);
+    console.log(`Lumen Railway installer v24 listening on ${port}`);
     void refreshDeploymentNetwork();
   });
   const timer = setInterval(() => { void refreshDeploymentNetwork(); }, NETWORK_REFRESH_MS);

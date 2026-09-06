@@ -1,4 +1,4 @@
-# Lumen Railway Installer v23
+# Lumen Railway Installer v24
 
 Standalone public installer hosted on Railway. This folder contains the complete deployable service.
 
@@ -18,3 +18,16 @@ At startup the service tests all six embedded HTTP CONNECT proxies against both 
 - `GET /health` — Railway health check and current route status
 - `GET /api/network` — current redacted route report
 - `POST /api/network/refresh` — repeat the route scan
+
+## Provisioning sequence
+
+The installer uses Railway's current public GraphQL API in this order:
+
+1. Create the project and production environment.
+2. Create an empty service.
+3. Apply service settings.
+4. Upsert protected variables with `skipDeploys: true`.
+5. Attach `/data` and create the public domain.
+6. Connect the GitHub fork and deploy its exact commit SHA.
+
+Before any mutation, candidate routes must pass authenticated GitHub and Railway identity checks.

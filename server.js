@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 
 /*
- * Lumen public self-contained Railway service installer — v24.0.0
+ * Lumen public self-contained Railway service installer — v25.0.0
  * Every user deploys this folder as a service in their own Railway account.
  * Runs on Node.js 22 with node:net/node:tls.
  * It does not persist submitted tokens and never writes them to logs.
@@ -16,7 +16,7 @@ const SOURCE_REPO = "Lumen-Project-Final";
 const SOURCE_FULL = SOURCE_OWNER + "/" + SOURCE_REPO;
 const GITHUB_API = "https://api.github.com";
 const RAILWAY_API = "https://backboard.railway.com/graphql/v2";
-const INSTALLER_VERSION = "24.0.0";
+const INSTALLER_VERSION = "25.0.0";
 const MAX_BODY_BYTES = 24 * 1024;
 const MAX_UPSTREAM_BYTES = 4 * 1024 * 1024;
 const HTTP_PROXIES = Object.freeze([
@@ -332,7 +332,7 @@ async function probeRoute(route, index) {
   let failureCode = "PROBE_FAILED";
   try {
     const githubResponse = await routeFetch(route, GITHUB_API + "/meta", {
-      method: "GET", headers: { Accept: "application/vnd.github+json", "User-Agent": "Lumen-Network-Probe/24" },
+      method: "GET", headers: { Accept: "application/vnd.github+json", "User-Agent": "Lumen-Network-Probe/25" },
     }, route.kind === "direct" ? DIRECT_PROBE_TIMEOUT_MS : PROXY_PROBE_TIMEOUT_MS);
     if (!githubResponse.ok) throw new Error("GitHub HTTP " + githubResponse.status);
     githubOk = true;
@@ -343,7 +343,7 @@ async function probeRoute(route, index) {
   // parallel, staying within Railway's six simultaneous socket limit.
   try {
     const railwayResponse = await routeFetch(route, RAILWAY_API, {
-      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "Lumen-Network-Probe/24" },
+      method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "Lumen-Network-Probe/25" },
       body: JSON.stringify({ query: "query LumenNetworkProbe { __typename }", variables: {} }),
     }, route.kind === "direct" ? DIRECT_PROBE_TIMEOUT_MS : PROXY_PROBE_TIMEOUT_MS);
     if (railwayResponse.status < 200 || railwayResponse.status >= 500) throw new Error("Railway HTTP " + railwayResponse.status);
@@ -364,16 +364,19 @@ async function probeRoute(route, index) {
 }
 
 async function selectTransportInternal() {
-  // Every proxy is tested from the running Railway deployment before one is chosen.
+  // Test all supplied proxies and direct Railway egress on every scan. Public
+  // proxy success does not prove that Authorization headers will be accepted.
   const proxyRoutes = HTTP_PROXIES.map((proxy) => ({ kind: "proxy", proxy }));
-  const proxyChecks = await Promise.all(proxyRoutes.map((route, index) => probeRoute(route, index)));
-  const healthy = proxyChecks.filter((item) => item.ok).sort((left, right) => left.latencyMs - right.latencyMs || left.index - right.index);
-  if (healthy.length) return { route: healthy[0].route, selected: healthy[0], checks: proxyChecks };
-
-  // Direct Railway egress is tested only after every configured proxy failed.
-  const directCheck = await probeRoute({ kind: "direct" }, HTTP_PROXIES.length);
+  const proxyChecksPromise = Promise.all(proxyRoutes.map((route, index) => probeRoute(route, index)));
+  const directCheckPromise = probeRoute({ kind: "direct" }, HTTP_PROXIES.length);
+  const [proxyChecks, directCheck] = await Promise.all([proxyChecksPromise, directCheckPromise]);
   const checks = [...proxyChecks, directCheck];
+  const healthy = proxyChecks.filter((item) => item.ok).sort((left, right) => left.latencyMs - right.latencyMs || left.index - right.index);
+
+  // Direct is preferred for token-bearing control-plane operations. Verified
+  // HTTP CONNECT proxies remain ordered fallbacks when direct egress is down.
   if (directCheck.ok) return { route: directCheck.route, selected: directCheck, checks };
+  if (healthy.length) return { route: healthy[0].route, selected: healthy[0], checks };
   const error = new InstallError("ALL_NETWORK_ROUTES_FAILED", "network", "All configured proxies and the direct Railway route failed the GitHub/Railway checks.", "همه پروکسی‌های تنظیم‌شده و مسیر مستقیم Railway در بررسی GitHub و Railway ناموفق بودند.", 502);
   error.networkChecks = checks;
   throw error;
@@ -411,55 +414,42 @@ function routeFailureSummary(route, error) {
   };
 }
 
-async function selectAuthenticatedTransport(network, githubToken, railwayToken) {
+async function selectAuthenticatedTransport(network, githubToken, _railwayToken) {
+  const directCandidate = network.checks.find((item) => item.ok && item.route && item.route.kind === "direct");
   const proxyCandidates = network.checks
     .filter((item) => item.ok && item.route && item.route.kind === "proxy")
     .sort((left, right) => left.latencyMs - right.latencyMs || left.index - right.index);
+  const candidates = [...(directCandidate ? [directCandidate] : []), ...proxyCandidates];
   const attempts = [];
   const credentialErrors = [];
-  let checks = [...network.checks];
 
-  const validate = async (candidate) => {
+  // Only GitHub identity is safe as a universal credential preflight. Railway's
+  // `me` query is account-token-only and rejects some otherwise usable scoped
+  // tokens, which caused v24's false NO_AUTHENTICATED_ROUTE result.
+  for (const candidate of candidates) {
     const route = candidate.route;
     try {
       const identity = await github(route, githubToken, "/user", { step: "github-token" });
-      await railway(route, railwayToken, "query InstallerIdentity { me { id name email } }", {}, "railway-token");
-      return { route, selected: candidate, identity, checks, authChecks: [...attempts, { label: routeLabel(route), ok: true }] };
+      return {
+        route,
+        selected: candidate,
+        identity,
+        checks: network.checks,
+        authChecks: [...attempts, { label: routeLabel(route), ok: true, githubOk: true, railwayReachable: true }],
+      };
     } catch (error) {
       attempts.push({ ...routeFailureSummary(route, error), ok: false });
-      if (error instanceof InstallError && ["GITHUB_TOKEN_INVALID", "GITHUB_PERMISSION", "RAILWAY_TOKEN_INVALID"].includes(error.code)) credentialErrors.push(error);
-      return null;
+      if (error instanceof InstallError && ["GITHUB_TOKEN_INVALID", "GITHUB_PERMISSION"].includes(error.code)) credentialErrors.push(error);
     }
-  };
-
-  // A public probe can pass while a proxy blocks Authorization headers or
-  // selected API operations. Qualify routes with both real account tokens
-  // before creating any GitHub fork or Railway resource.
-  for (const candidate of proxyCandidates) {
-    const accepted = await validate(candidate);
-    if (accepted) return accepted;
-  }
-
-  // If public proxy probes passed but authenticated operations did not, test
-  // direct Railway egress as the final safe fallback before making mutations.
-  let directCandidate = checks.find((item) => item.route && item.route.kind === "direct");
-  if (!directCandidate) {
-    directCandidate = await probeRoute({ kind: "direct" }, HTTP_PROXIES.length);
-    checks = [...checks, directCandidate];
-  }
-  if (directCandidate.ok) {
-    const accepted = await validate(directCandidate);
-    if (accepted) return accepted;
   }
 
   const allCodes = credentialErrors.map((error) => error.code);
   if (allCodes.length && allCodes.every((code) => code === "GITHUB_TOKEN_INVALID")) throw credentialErrors[0];
   if (allCodes.length && allCodes.every((code) => code === "GITHUB_PERMISSION")) throw credentialErrors[0];
-  if (allCodes.length && allCodes.every((code) => code === "RAILWAY_TOKEN_INVALID")) throw credentialErrors[0];
   const error = new InstallError(
-    "NO_AUTHENTICATED_ROUTE", "network-auth",
-    "No route could complete authenticated GitHub and Railway checks. Review /api/network and retry.",
-    "هیچ مسیری نتوانست بررسی احراز هویت GitHub و Railway را کامل کند. وضعیت /api/network را ببینید و دوباره تلاش کنید.",
+    "NO_GITHUB_AUTH_ROUTE", "github-token",
+    "No network route could validate the GitHub token.",
+    "هیچ مسیر شبکه‌ای نتوانست توکن GitHub را اعتبارسنجی کند.",
     502,
   );
   error.routeAttempts = attempts;
@@ -480,7 +470,7 @@ async function github(route, token, path, options = {}) {
       Accept: "application/vnd.github+json",
       Authorization: "Bearer " + token,
       "Content-Type": "application/json",
-      "User-Agent": "Lumen-Railway-Installer/24",
+      "User-Agent": "Lumen-Railway-Installer/25",
       "X-GitHub-Api-Version": "2022-11-28",
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
@@ -535,7 +525,7 @@ async function railway(route, token, query, variables, step) {
       Accept: "application/json",
       Authorization: "Bearer " + token,
       "Content-Type": "application/json",
-      "User-Agent": "Lumen-Railway-Installer/24",
+      "User-Agent": "Lumen-Railway-Installer/25",
     },
     body: JSON.stringify({ query, variables }),
   }, 22000);
@@ -551,7 +541,9 @@ async function railway(route, token, query, variables, step) {
     const safeDetails = rawMessages.join(" | ").replaceAll(token, "[redacted]").replace(/[\r\n\0]+/g, " ").slice(0, 360);
     const messages = safeDetails.toLowerCase();
     let error;
-    if (messages.includes("github") || messages.includes("repository") || messages.includes("repo")) {
+    if (messages.includes("not authorized") || messages.includes("unauthorized") || messages.includes("not authenticated") || messages.includes("invalid token")) {
+      error = new InstallError("RAILWAY_TOKEN_INVALID", "railway-token", "Railway rejected this token. Create an Account Token with No workspace selected; workspace and project tokens cannot create a personal project.", "Railway این توکن را نپذیرفت. در Account → Tokens یک Account Token با گزینه No workspace بسازید؛ توکن Workspace یا Project نمی‌تواند پروژه شخصی جدید بسازد.", 401);
+    } else if (messages.includes("github") || messages.includes("repository") || messages.includes("repo")) {
       error = new InstallError("RAILWAY_GITHUB_NOT_CONNECTED", step, "Railway cannot access the fork. Connect GitHub in Railway Account → Integrations, grant access to the fork, then retry.", "Railway به فورک دسترسی ندارد. در Railway از Account ← Integrations، گیت‌هاب را متصل و دسترسی فورک را فعال کنید، سپس دوباره تلاش کنید.", 409);
     } else if (messages.includes("limit") || messages.includes("plan") || messages.includes("volume")) {
       error = new InstallError("RAILWAY_PLAN_LIMIT", step, "A Railway plan or resource limit blocked this step. Check your account usage and project limits.", "محدودیت پلن یا منابع Railway مانع این مرحله شد. مصرف حساب و محدودیت‌های پروژه را بررسی کنید.", 409);
@@ -807,21 +799,21 @@ html[data-theme="dark"]{
 </header>
 <main class="layout">
  <section class="hero" aria-labelledby="hero-title">
-  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۴" data-en="Public Lumen installer · v24">نصاب عمومی Lumen · نسخه ۲۴</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
-  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v24</span><span class="chip">6 proxies + direct</span></div></div>
+  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۵" data-en="Public Lumen installer · v25">نصاب عمومی Lumen · نسخه ۲۵</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
+  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v25</span><span class="chip">6 proxies + direct</span></div></div>
  </section>
  <section class="panel">
   <div class="view" id="form-view">
    <div class="panel-head"><div class="step-number">01</div><div><h2 data-fa="دسترسی‌های نصب" data-en="Installation access">دسترسی‌های نصب</h2><p class="muted" data-fa="نصاب توکن‌ها را نگه‌داری یا لاگ نمی‌کند؛ پس از بررسی، آن‌ها داخل متغیرهای محافظت‌شده Railway خودتان ثبت می‌شوند." data-en="The installer never persists or logs tokens; after verification, they are stored in your own protected Railway service variables.">نصاب توکن‌ها را نگه‌داری یا لاگ نمی‌کند؛ پس از بررسی، آن‌ها داخل متغیرهای محافظت‌شده Railway خودتان ثبت می‌شوند.</p></div></div>
    <form id="install-form" novalidate>
     <div class="field"><div class="field-top"><label for="github-token" data-fa="توکن GitHub" data-en="GitHub token">توکن GitHub</label><a class="direct-link" href="https://github.com/settings/tokens/new?scopes=public_repo&description=Lumen%20Railway%20Installer" target="_blank" rel="noopener noreferrer" data-fa="ساخت مستقیم ↗" data-en="Create token ↗">ساخت مستقیم ↗</a></div><div class="input-wrap"><input id="github-token" type="password" required autocomplete="new-password" spellcheck="false" aria-describedby="github-help"><button class="reveal" type="button" data-reveal="github-token" aria-label="Show or hide GitHub token">◉</button></div><small class="support" id="github-help" data-fa="توکن کلاسیک با دسترسی public_repo؛ برای فورک و استار مخزن عمومی." data-en="Classic token with public_repo scope, used to fork and star the public source.">توکن کلاسیک با دسترسی public_repo؛ برای فورک و استار مخزن عمومی.</small></div>
-    <div class="field"><div class="field-top"><label for="railway-token" data-fa="توکن حساب Railway" data-en="Railway account token">توکن حساب Railway</label><a class="direct-link" href="https://railway.com/account/tokens" target="_blank" rel="noopener noreferrer" data-fa="ساخت مستقیم ↗" data-en="Create token ↗">ساخت مستقیم ↗</a></div><div class="input-wrap"><input id="railway-token" type="password" required autocomplete="new-password" spellcheck="false" aria-describedby="railway-help"><button class="reveal" type="button" data-reveal="railway-token" aria-label="Show or hide Railway token">◉</button></div><small class="support" id="railway-help" data-fa="Account Token لازم است؛ Project Token نمی‌تواند پروژه جدید بسا��د." data-en="An Account Token is required; a Project Token cannot create a new project.">Account Token لازم است؛ Project Token نمی‌تواند پروژه جدید بسازد.</small></div>
+    <div class="field"><div class="field-top"><label for="railway-token" data-fa="توکن حساب Railway" data-en="Railway account token">توکن حساب Railway</label><a class="direct-link" href="https://railway.com/account/tokens" target="_blank" rel="noopener noreferrer" data-fa="ساخت مستقیم ↗" data-en="Create token ↗">ساخت مستقیم ↗</a></div><div class="input-wrap"><input id="railway-token" type="password" required autocomplete="new-password" spellcheck="false" aria-describedby="railway-help"><button class="reveal" type="button" data-reveal="railway-token" aria-label="Show or hide Railway token">◉</button></div><small class="support" id="railway-help" data-fa="در Account → Tokens گزینه No workspace را انتخاب و Account Token بسازید؛ Workspace/Project Token قابل استفاده نیست." data-en="In Account → Tokens choose No workspace and create an Account Token; workspace/project tokens are not supported.">در Account → Tokens گزینه No workspace را انتخاب و Account Token بسازید؛ Workspace/Project Token قابل استفاده نیست.</small></div>
     <div class="guide" aria-label="Preparation guide">
      <div class="guide-row"><div class="guide-icon">1</div><div class="guide-copy"><b data-fa="توکن GitHub را بسازید" data-en="Create GitHub token">توکن GitHub را بسازید</b><span data-fa="لینک بالا با public_repo آماده است" data-en="The link above preselects public_repo">لینک بالا با public_repo آماده است</span></div><a href="https://github.com/settings/tokens/new?scopes=public_repo&description=Lumen%20Railway%20Installer" target="_blank" rel="noopener noreferrer" aria-label="Open GitHub token page">↗</a></div>
-     <div class="guide-row"><div class="guide-icon">2</div><div class="guide-copy"><b data-fa="Account Token ریلوی را بسازید" data-en="Create Railway Account Token">Account Token ریلوی را بسازید</b><span data-fa="از صفحه Tokens در تنظیمات حساب" data-en="From the Tokens page in account settings">از صفحه Tokens در تنظیمات حساب</span></div><a href="https://railway.com/account/tokens" target="_blank" rel="noopener noreferrer" aria-label="Open Railway token page">↗</a></div>
+     <div class="guide-row"><div class="guide-icon">2</div><div class="guide-copy"><b data-fa="Account Token ریلوی را بسازید" data-en="Create Railway Account Token">Account Token ریلوی را بسازید</b><span data-fa="از Account → Tokens با انتخاب No workspace" data-en="From Account → Tokens with No workspace selected">از Account → Tokens با انتخاب No workspace</span></div><a href="https://railway.com/account/tokens" target="_blank" rel="noopener noreferrer" aria-label="Open Railway token page">↗</a></div>
      <div class="guide-row"><div class="guide-icon">3</div><div class="guide-copy"><b data-fa="GitHub را به Railway متصل کنید" data-en="Connect GitHub to Railway">GitHub را به Railway متصل کنید</b><span data-fa="اجازه دسترسی به فورک Lumen را بدهید" data-en="Grant Railway access to the Lumen fork">اجازه دسترسی به فورک Lumen را بدهید</span></div><a href="https://railway.com/account/integrations" target="_blank" rel="noopener noreferrer" aria-label="Open Railway integrations">↗</a></div>
     </div>
-    <div class="notice"><span aria-hidden="true">◆</span><span data-fa="این فایل برای استفاده عمومی است، اما هر شخص باید نسخه خودش را در حساب Railway خودش دیپلوی کند. ابتدا هر شش پروکسی روی همان سرویس Railway آزمایش می‌شوند؛ سریع‌ترین مسیر سالم انتخاب می���شود و فقط اگر همه ناموفق باشند اتصال مستقیم بررسی می‌شود. هرگز توکن را در نصب‌کننده متعلق به شخص دیگری وارد نکنید." data-en="This file is public, but every user must deploy a personal copy in their own Railway account. All six proxies are tested by the running Railway service; the fastest healthy route is selected, and direct egress is tested only if every proxy fails. Never enter tokens into another person's installer.">این فایل برای استفاده عمومی است، اما هر شخص باید نسخه خودش را در حساب Railway خودش دیپلوی کند. ابتدا هر شش پروکسی روی همان سرویس Railway آزمایش می‌شوند؛ سریع‌ترین مسیر سالم انتخاب می‌شود و فقط اگر همه ناموفق باشند اتصال مستقیم بررسی می‌شود. هرگز توکن را در نصب‌کننده متعلق به شخص دیگری وارد نکنید.</span></div>
+    <div class="notice"><span aria-hidden="true">◆</span><span data-fa="این فایل برای استفاده عمومی است، اما هر شخص باید نسخه خودش را در حساب Railway خودش دیپلوی کند. ابتدا هر شش پروکسی روی همان سرویس Railway آزمایش می‌شوند؛ سریع‌ترین مسیر سالم انتخاب می���شود و فقط اگر همه ناموفق باشند اتصال مستقیم بررسی می‌شود. هرگز توکن را در نصب‌کننده متعلق به شخص دیگری وارد نکنید." data-en="This file is public, but every user must deploy a personal copy in their own Railway account. All proxies and direct egress are tested by the Railway service; token-bearing operations prefer direct egress and use healthy proxies as fallbacks. Never enter tokens into another person's installer.">این فایل برای استفاده عمومی است، اما هر شخص باید نسخه خودش را در حساب Railway خودش دیپلوی کند. همه پروکسی‌ها و مسیر مستقیم روی همان سرویس Railway آزمایش می‌شوند؛ برای عملیات دارای توکن ابتدا مسیر مستقیم و سپس پروکسی‌های سالم امتحان می‌شوند. هرگز توکن را در نصب‌کننده متعلق به شخص دیگری وارد نکنید.</span></div>
     <button class="filled" id="install-button" type="submit"><span aria-hidden="true">✦</span><span data-fa="شروع نصب خودکار" data-en="Start automated setup">شروع نصب خودکار</span></button>
    </form>
   </div>
@@ -835,7 +827,7 @@ html[data-theme="dark"]{
 <script nonce="__NONCE__">
 (function(){
  var lang=localStorage.getItem('lumen-installer-lang')||'fa';var theme=localStorage.getItem('lumen-installer-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');var progressTimer=null;
- var stepDefs=[['آزمایش همه پروکسی‌ها و مسیر مستقیم در صورت نیاز','Test all proxies, then direct if needed'],['استار کردن سورس رسمی','Star official source'],['ساخت یا بررسی فورک','Create or verify fork'],['ساخت پروژه Railway','Create Railway project'],['تنظیم متغیرها و سرویس','Configure service and variables'],['اتصال فضای دائمی /data','Attach persistent /data'],['ساخت دامنه عمومی','Generate public domain'],['شروع دیپلوی','Start deployment']];
+ var stepDefs=[['آزمایش مسیر مستقیم و همه پروکسی‌ها','Test direct egress and all proxies'],['استار کردن سورس رسمی','Star official source'],['ساخت یا بررسی فورک','Create or verify fork'],['ساخت پروژه Railway','Create Railway project'],['تنظیم متغیرها و سرویس','Configure service and variables'],['اتصال فضای دائمی /data','Attach persistent /data'],['ساخت دامنه عمومی','Generate public domain'],['شروع دیپلوی','Start deployment']];
  function applyLocale(){document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-fa]').forEach(function(el){el.textContent=el.getAttribute(lang==='fa'?'data-fa':'data-en')});document.querySelector('.lang-text').textContent=lang==='fa'?'EN':'فا';renderSteps(window.__activeStep||0)}
  function applyTheme(){document.documentElement.setAttribute('data-theme',theme)}
  function show(id){['form-view','progress-view','success-view','error-view'].forEach(function(name){document.getElementById(name).hidden=name!==id})}
@@ -1037,7 +1029,7 @@ async function start() {
   const port = Number.parseInt(process.env.PORT || "3000", 10);
   const server = createInstallerServer();
   server.listen(port, "0.0.0.0", () => {
-    console.log(`Lumen Railway installer v24 listening on ${port}`);
+    console.log(`Lumen Railway installer v25 listening on ${port}`);
     void refreshDeploymentNetwork();
   });
   const timer = setInterval(() => { void refreshDeploymentNetwork(); }, NETWORK_REFRESH_MS);

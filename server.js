@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 
 /*
- * Lumen public self-contained Railway service installer — v27.0.0
+ * Lumen public self-contained Railway service installer — v28.0.0
  * Every user deploys this folder as a service in their own Railway account.
  * Runs on Node.js 22 with node:net/node:tls.
  * It does not persist submitted tokens and never writes them to logs.
@@ -16,7 +16,7 @@ const SOURCE_REPO = "Lumen-Project-Final";
 const SOURCE_FULL = SOURCE_OWNER + "/" + SOURCE_REPO;
 const GITHUB_API = "https://api.github.com";
 const RAILWAY_API = "https://backboard.railway.com/graphql/v2";
-const INSTALLER_VERSION = "27.0.0";
+const INSTALLER_VERSION = "28.0.0";
 const MAX_BODY_BYTES = 24 * 1024;
 const MAX_UPSTREAM_BYTES = 4 * 1024 * 1024;
 const HTTP_PROXIES = Object.freeze([
@@ -97,6 +97,15 @@ function htmlResponse() {
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function deploymentPollDelayMs() {
+  const overridden = Number(globalThis.__LUMEN_TEST_DEPLOYMENT_POLL_MS__);
+  return Number.isFinite(overridden) && overridden >= 0 ? overridden : 20_000;
+}
+
+function emitProgress(report, update) {
+  try { report(Object.freeze({ ...update, updatedAt: new Date().toISOString() })); } catch (_) {}
 }
 
 function transportError(code, messageEn, messageFa, status = 502) {
@@ -634,8 +643,10 @@ function railwayProjectName(ownerLogin, entropy = Date.now().toString(36)) {
     .replace(/-+$/g, "");
 }
 
-async function provisionRailway(route, railwayToken, githubToken, fork, branch, commitSha, adminPassword) {
+async function provisionRailway(route, railwayToken, githubToken, fork, branch, commitSha, adminPassword, report = () => {}) {
+  emitProgress(report, { phase: "workspace", step: 3, titleFa: "کشف یا ساخت Workspace", titleEn: "Resolving or creating Workspace" });
   const workspace = await ensureWorkspace(route, railwayToken, fork.owner.login);
+  emitProgress(report, { phase: "project", step: 4, titleFa: "ساخت Project داخل Workspace", titleEn: "Creating Project in Workspace" });
   let projectName = railwayProjectName(fork.owner.login);
   let created;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -672,6 +683,7 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
   }
   if (!environment || !environment.id) throw new InstallError("ENVIRONMENT_MISSING", "environment", "Railway did not create the production environment.", "Railway محیط production را ایجاد نکرد.", 502);
 
+  emitProgress(report, { phase: "service", step: 5, titleFa: "ساخت سرویس و تنظیم Virginia و IPv6", titleEn: "Creating service with Virginia and IPv6" });
   // Create an empty service first, then configure it before connecting the source.
   const serviceResult = await railway(
     route,
@@ -687,7 +699,7 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
     route,
     railwayToken,
     "mutation InstallerServiceSettings($serviceId: String!, $environmentId: String!, $input: ServiceInstanceUpdateInput!) { serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId, input: $input) }",
-    { serviceId: service.id, environmentId: environment.id, input: { startCommand: "python main.py", healthcheckPath: "/health", healthcheckTimeout: 300 } },
+    { serviceId: service.id, environmentId: environment.id, input: { startCommand: "python main.py", healthcheckPath: "/health", healthcheckTimeout: 300, ipv6EgressEnabled: true, region: "us-east4-eqdc4a", multiRegionConfig: { "us-east4-eqdc4a": { numReplicas: 1 } } } },
     "service-settings"
   );
 
@@ -715,6 +727,7 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
     "variables"
   );
 
+  emitProgress(report, { phase: "volume", step: 6, titleFa: "اتصال فضای دائمی /data", titleEn: "Attaching persistent /data storage" });
   await railway(
     route,
     railwayToken,
@@ -723,6 +736,7 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
     "volume"
   );
 
+  emitProgress(report, { phase: "domain", step: 7, titleFa: "ساخت دامنه عمومی", titleEn: "Creating public domain" });
   const domainResult = await railway(
     route,
     railwayToken,
@@ -741,6 +755,7 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
     "source"
   );
 
+  emitProgress(report, { phase: "deploy", step: 8, titleFa: "شروع Deployment در Virginia", titleEn: "Starting deployment in Virginia", deploymentStatus: "QUEUED", attempt: 0, maxAttempts: 7 });
   const deployResult = await railway(
     route,
     railwayToken,
@@ -749,16 +764,44 @@ async function provisionRailway(route, railwayToken, githubToken, fork, branch, 
     "deploy"
   );
   const deploymentId = String(deployResult.serviceInstanceDeployV2 || "");
+  if (!deploymentId) throw new InstallError("DEPLOYMENT_ID_MISSING", "deploy", "Railway did not return a deployment ID.", "Railway شناسه Deployment را برنگرداند.", 502);
   let deploymentStatus = "QUEUED";
-  if (deploymentId) {
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      await wait(1800);
-      try {
-        const checked = await railway(route, railwayToken, "query InstallerDeployment($id: String!) { deployment(id: $id) { id status } }", { id: deploymentId }, "deployment-status");
-        deploymentStatus = checked.deployment && checked.deployment.status ? String(checked.deployment.status) : deploymentStatus;
-        if (["SUCCESS", "FAILED", "CRASHED"].includes(deploymentStatus)) break;
-      } catch (_) { break; }
+  let lastPollError = "";
+  for (let attempt = 1; attempt <= 7; attempt += 1) {
+    emitProgress(report, {
+      phase: "deployment-status", step: 8, attempt, maxAttempts: 7, deploymentStatus,
+      titleFa: "وضعیت Deployment: " + deploymentStatus,
+      titleEn: "Deployment status: " + deploymentStatus,
+      detailFa: "۲۰ ثانیه انتظار؛ بررسی " + attempt + " از ۷",
+      detailEn: "Waiting 20 seconds; check " + attempt + " of 7",
+    });
+    await wait(deploymentPollDelayMs());
+    try {
+      const checked = await railway(route, railwayToken, "query InstallerDeployment($id: String!) { deployment(id: $id) { id status } }", { id: deploymentId }, "deployment-status");
+      deploymentStatus = checked.deployment && checked.deployment.status ? String(checked.deployment.status).toUpperCase() : "NO_RESPONSE";
+      lastPollError = "";
+    } catch (error) {
+      deploymentStatus = "NO_RESPONSE";
+      lastPollError = String(error && (error.safeDetails || error.messageEn || error.message) || "").slice(0, 180);
     }
+    emitProgress(report, {
+      phase: "deployment-status", step: 8, attempt, maxAttempts: 7, deploymentStatus,
+      titleFa: "وضعیت Deployment: " + deploymentStatus,
+      titleEn: "Deployment status: " + deploymentStatus,
+      detailFa: "نتیجه بررسی " + attempt + " از ۷",
+      detailEn: "Result from check " + attempt + " of 7",
+    });
+    if (deploymentStatus === "SUCCESS") break;
+    if (["FAILED", "CRASHED", "REMOVED"].includes(deploymentStatus)) {
+      const failed = new InstallError("DEPLOYMENT_FAILED", "deployment-status", "Railway deployment ended with status " + deploymentStatus + ".", "Deployment در Railway با وضعیت " + deploymentStatus + " متوقف شد.", 502);
+      failed.safeDetails = "Deployment status: " + deploymentStatus;
+      throw failed;
+    }
+  }
+  if (deploymentStatus !== "SUCCESS") {
+    const timeout = new InstallError("DEPLOYMENT_TIMEOUT", "deployment-status", "The deployment did not reach SUCCESS after 7 checks spaced 20 seconds apart.", "Deployment پس از ۷ بررسی با فاصله‌های ۲۰ ثانیه‌ای به وضعیت SUCCESS نرسید.", 504);
+    timeout.safeDetails = "Last deployment status: " + deploymentStatus + (lastPollError ? " | " + lastPollError : "");
+    throw timeout;
   }
   return {
     workspaceId: workspace.id,
@@ -783,10 +826,12 @@ function validateTokenShape(value, kind) {
   return token;
 }
 
-async function installPayload(payload) {
+async function installPayload(payload, options = {}) {
   let githubToken = validateTokenShape(payload && payload.githubToken, "github");
   let railwayToken = validateTokenShape(payload && payload.railwayToken, "railway");
+  const report = typeof options.onProgress === "function" ? options.onProgress : () => {};
   try {
+    emitProgress(report, { phase: "network", step: 0, titleFa: "بررسی مسیرهای شبکه", titleEn: "Checking network routes" });
     const publicNetwork = await selectTransport();
     const network = await selectAuthenticatedTransport(publicNetwork, githubToken, railwayToken);
     const route = network.route;
@@ -794,14 +839,16 @@ async function installPayload(payload) {
     const login = identity && identity.login ? String(identity.login) : "";
     if (!/^[A-Za-z0-9-]{1,39}$/.test(login)) throw new InstallError("GITHUB_IDENTITY", "github-token", "GitHub did not return a valid account.", "GitHub حساب معتبری برنگرداند.", 502);
 
+    emitProgress(report, { phase: "star", step: 1, titleFa: "استار کردن سورس رسمی", titleEn: "Starring official source" });
     await github(route, githubToken, "/user/starred/" + SOURCE_FULL, { method: "PUT", step: "star" });
+    emitProgress(report, { phase: "fork", step: 2, titleFa: "ساخت یا بررسی Fork", titleEn: "Creating or verifying Fork" });
     const fork = await ensureFork(route, githubToken, login);
     const branch = String(fork.default_branch || "main");
     const commit = await github(route, githubToken, "/repos/" + encodeURIComponent(login) + "/" + SOURCE_REPO + "/commits/" + encodeURIComponent(branch), { step: "fork" });
     if (!commit || !/^[0-9a-f]{40}$/i.test(String(commit.sha || ""))) throw new InstallError("FORK_COMMIT", "fork", "The fork has no deployable branch commit yet.", "فورک هنوز کامیت قابل دیپلوی ندارد.", 502);
 
     const adminPassword = randomSecret(18);
-    const railwayResult = await provisionRailway(route, railwayToken, githubToken, fork, branch, String(commit.sha), adminPassword);
+    const railwayResult = await provisionRailway(route, railwayToken, githubToken, fork, branch, String(commit.sha), adminPassword, report);
     return {
       ok: true,
       installerVersion: INSTALLER_VERSION,
@@ -821,7 +868,7 @@ async function installPayload(payload) {
   }
 }
 
-async function handleInstall(request) {
+async function parseInstallRequest(request) {
   const requestUrl = new URL(request.url);
   const origin = request.headers.get("Origin");
   if (origin && origin !== requestUrl.origin) {
@@ -841,7 +888,74 @@ async function handleInstall(request) {
   } catch (_) {
     throw new InstallError("INVALID_JSON", "request", "The request body is not valid JSON.", "بدنه درخواست JSON معتبر نیست.", 400);
   }
-  return installPayload(payload);
+  return payload;
+}
+
+async function handleInstall(request, options = {}) {
+  return installPayload(await parseInstallRequest(request), options);
+}
+
+function installErrorDetail(error, requestId = randomSecret(9)) {
+  const known = error instanceof InstallError;
+  return {
+    code: known ? error.code : "INTERNAL_ERROR",
+    step: known ? error.step : "internal",
+    messageEn: known ? error.messageEn : "The installer encountered an internal error.",
+    messageFa: known ? error.messageFa : "نصاب با یک خطای داخلی روبه‌رو شد.",
+    details: known && error.safeDetails ? error.safeDetails : undefined,
+    routeAttempts: known && error.routeAttempts ? error.routeAttempts : undefined,
+    requestId,
+  };
+}
+
+function publicProgress(update) {
+  const value = update && typeof update === "object" ? update : {};
+  return {
+    phase: String(value.phase || "running").slice(0, 48),
+    step: Number.isInteger(value.step) ? Math.max(0, Math.min(8, value.step)) : 0,
+    titleFa: String(value.titleFa || "نصب در حال اجراست").slice(0, 160),
+    titleEn: String(value.titleEn || "Installation is running").slice(0, 160),
+    detailFa: value.detailFa ? String(value.detailFa).slice(0, 180) : undefined,
+    detailEn: value.detailEn ? String(value.detailEn).slice(0, 180) : undefined,
+    deploymentStatus: value.deploymentStatus ? String(value.deploymentStatus).slice(0, 40) : undefined,
+    attempt: Number.isInteger(value.attempt) ? value.attempt : undefined,
+    maxAttempts: Number.isInteger(value.maxAttempts) ? value.maxAttempts : undefined,
+  };
+}
+
+function cleanInstallJobs() {
+  const now = Date.now();
+  for (const [id, job] of installJobs) {
+    if (job.state !== "running" && now - job.updatedAtMs > INSTALL_JOB_TTL_MS) installJobs.delete(id);
+  }
+}
+
+function startInstallJob(payload) {
+  cleanInstallJobs();
+  const installId = randomSecret(24);
+  const startedAt = new Date().toISOString();
+  installJobs.set(installId, { state: "running", startedAt, updatedAt: startedAt, updatedAtMs: Date.now(), ...publicProgress({ phase: "accepted", step: 0 }) });
+  activeInstalls += 1;
+  let secretPayload = payload;
+  void installPayload(secretPayload, {
+    onProgress(update) {
+      const current = installJobs.get(installId);
+      if (!current || current.state !== "running") return;
+      installJobs.set(installId, { ...current, ...publicProgress(update), updatedAt: new Date().toISOString(), updatedAtMs: Date.now() });
+    },
+  }).then((result) => {
+    const current = installJobs.get(installId) || {};
+    installJobs.set(installId, { ...current, state: "completed", phase: "completed", step: 9, titleFa: "Deployment با موفقیت انجام شد", titleEn: "Deployment completed successfully", result, updatedAt: new Date().toISOString(), updatedAtMs: Date.now() });
+  }).catch((error) => {
+    const detail = installErrorDetail(error);
+    console.error(`[install:${detail.requestId}] code=${detail.code} step=${detail.step}` + (detail.details ? ` details=${detail.details}` : ""));
+    const current = installJobs.get(installId) || {};
+    installJobs.set(installId, { ...current, state: "failed", phase: "failed", titleFa: detail.messageFa, titleEn: detail.messageEn, error: detail, updatedAt: new Date().toISOString(), updatedAtMs: Date.now() });
+  }).finally(() => {
+    secretPayload = null;
+    activeInstalls = Math.max(0, activeInstalls - 1);
+  });
+  return installId;
 }
 
 const INSTALLER_HTML = `<!doctype html>
@@ -893,8 +1007,8 @@ html[data-theme="dark"]{
 </header>
 <main class="layout">
  <section class="hero" aria-labelledby="hero-title">
-  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۷" data-en="Public Lumen installer · v27">نصاب عمومی Lumen · نسخه ۲۷</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
-  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v27</span><span class="chip">6 proxies + direct</span></div></div>
+  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۸" data-en="Public Lumen installer · v28">نصاب عمومی Lumen · نسخه ۲۸</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
+  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v28</span><span class="chip">6 proxies + direct</span></div></div>
  </section>
  <section class="panel">
   <div class="view" id="form-view">
@@ -911,7 +1025,7 @@ html[data-theme="dark"]{
     <button class="filled" id="install-button" type="submit"><span aria-hidden="true">✦</span><span data-fa="شروع نصب خودکار" data-en="Start automated setup">شروع نصب خودکار</span></button>
    </form>
   </div>
-  <div class="view" id="progress-view" hidden aria-live="polite"><div class="progress-head"><div class="spinner" aria-hidden="true"></div><h2 data-fa="ستاپ در حال اجراست" data-en="Setup is running">ستاپ در حال اجراست</h2><p class="muted" data-fa="صفحه را نبندید؛ ساخت فورک و دیپلوی ممکن است چند دقیقه زمان ببرد." data-en="Keep this page open. Fork creation and deployment may take a few minutes.">صفحه را نبندید؛ ساخت فورک و دیپلوی ممکن است چند دقیقه زمان ببرد.</p></div><div class="steps" id="steps"></div></div>
+  <div class="view" id="progress-view" hidden aria-live="polite"><div class="progress-head"><div class="spinner" aria-hidden="true"></div><h2 id="progress-title" data-fa="ستاپ در حال اجراست" data-en="Setup is running">ستاپ در حال اجراست</h2><p class="muted" id="progress-detail" data-fa="صفحه را نبندید؛ وضعیت واقعی Deployment نمایش داده می‌شود." data-en="Keep this page open; the live Deployment status appears here.">صفحه را نبندید؛ وضعیت واقعی Deployment نمایش داده می‌شود.</p></div><div class="steps" id="steps"></div></div>
   <div class="view" id="success-view" hidden aria-live="polite"><div class="success-mark">✓</div><h2 data-fa="پنل آماده شد" data-en="Your panel is ready">پنل آماده شد</h2><p class="muted" id="success-copy"></p><div class="result"><div class="result-row"><div><label data-fa="لینک پنل مدیریت" data-en="Management panel URL">لینک پنل مدیریت</label><code id="panel-url"></code></div><button class="copy" type="button" data-copy="panel-url" aria-label="Copy panel URL">⧉</button></div><div class="result-row"><div><label data-fa="رمز ادمین — فقط همین‌بار نمایش داده می‌شود" data-en="Admin password — shown once">رمز ادمین — فقط همین‌بار نمایش داده می‌شود</label><code id="admin-password"></code></div><button class="copy" type="button" data-copy="admin-password" aria-label="Copy admin password">⧉</button></div><div class="result-row"><div><label data-fa="فورک شما" data-en="Your fork">فو��ک شما</label><code id="fork-repository"></code></div><button class="copy" type="button" data-copy="fork-repository" aria-label="Copy fork repository">⧉</button></div><div class="result-row"><div><label data-fa="Workspace انتخاب‌شده" data-en="Selected workspace">Workspace انتخاب‌شده</label><code id="workspace-name"></code></div><button class="copy" type="button" data-copy="workspace-name" aria-label="Copy workspace name">⧉</button></div><div class="result-row"><div><label data-fa="مسیر شبکه انتخاب‌شده" data-en="Selected network route">مسیر شبکه انتخاب‌شده</label><code id="network-route"></code></div><button class="copy" type="button" data-copy="network-route" aria-label="Copy selected route">⧉</button></div></div><div class="actions"><a class="filled" id="open-panel" target="_blank" rel="noopener noreferrer" data-fa="باز کردن پنل" data-en="Open panel">باز کردن پنل</a><a class="tonal" id="open-railway" target="_blank" rel="noopener noreferrer" data-fa="نمایش در Railway" data-en="View in Railway">نمایش در Railway</a></div></div>
   <div class="view" id="error-view" hidden aria-live="assertive"><div class="error-mark">!</div><h2 data-fa="نصب متوقف شد" data-en="Setup stopped">نصب متوقف شد</h2><div class="error-box" id="error-message"></div><button class="tonal" id="retry" type="button" data-fa="بازگشت و تلاش دوباره" data-en="Go back and retry">بازگشت و تلاش دوباره</button></div>
  </section>
@@ -920,9 +1034,9 @@ html[data-theme="dark"]{
 </div>
 <script nonce="__NONCE__">
 (function(){
- var lang=localStorage.getItem('lumen-installer-lang')||'fa';var theme=localStorage.getItem('lumen-installer-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');var progressTimer=null;
+ var lang=localStorage.getItem('lumen-installer-lang')||'fa';var theme=localStorage.getItem('lumen-installer-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');var liveProgress=null;
  var stepDefs=[['آزمایش مسیر مستقیم و همه پروکسی‌ها','Test direct egress and all proxies'],['استار کردن سورس رسمی','Star official source'],['ساخت یا بررسی فورک','Create or verify fork'],['کشف یا ساخت Workspace','Resolve or create workspace'],['ساخت پروژه Railway','Create Railway project'],['تنظیم متغیرها و سرویس','Configure service and variables'],['اتصال فضای دائمی /data','Attach persistent /data'],['ساخت دامنه عمومی','Generate public domain'],['شروع دیپلوی','Start deployment']];
- function applyLocale(){document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-fa]').forEach(function(el){el.textContent=el.getAttribute(lang==='fa'?'data-fa':'data-en')});document.querySelector('.lang-text').textContent=lang==='fa'?'EN':'فا';renderSteps(window.__activeStep||0)}
+ function applyLocale(){document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-fa]').forEach(function(el){el.textContent=el.getAttribute(lang==='fa'?'data-fa':'data-en')});document.querySelector('.lang-text').textContent=lang==='fa'?'EN':'فا';renderSteps(window.__activeStep||0);renderLiveProgress(liveProgress)}
  function applyTheme(){document.documentElement.setAttribute('data-theme',theme)}
  function show(id){['form-view','progress-view','success-view','error-view'].forEach(function(name){document.getElementById(name).hidden=name!==id})}
  function renderSteps(active){var box=document.getElementById('steps');if(!box)return;box.innerHTML='';stepDefs.forEach(function(item,index){var row=document.createElement('div');row.className='progress-step '+(index<active?'done':index===active?'active':'');var dot=document.createElement('div');dot.className='step-dot';dot.textContent=index<active?'✓':String(index+1);var label=document.createElement('span');label.textContent=item[lang==='fa'?0:1];var state=document.createElement('small');state.textContent=index<active?(lang==='fa'?'انجام شد':'Done'):index===active?(lang==='fa'?'در حال انجام':'Working'):'—';row.append(dot,label,state);box.appendChild(row)})}
@@ -931,7 +1045,11 @@ html[data-theme="dark"]{
  document.querySelectorAll('[data-reveal]').forEach(function(button){button.addEventListener('click',function(){var input=document.getElementById(button.getAttribute('data-reveal'));input.type=input.type==='password'?'text':'password'})});
  document.querySelectorAll('[data-copy]').forEach(function(button){button.addEventListener('click',function(){var text=document.getElementById(button.getAttribute('data-copy')).textContent;navigator.clipboard.writeText(text).then(function(){button.textContent='✓';setTimeout(function(){button.textContent='⧉'},1200)})})});
  document.getElementById('retry').addEventListener('click',function(){show('form-view')});
- document.getElementById('install-form').addEventListener('submit',async function(event){event.preventDefault();var ghInput=document.getElementById('github-token'),rwInput=document.getElementById('railway-token');var gh=ghInput.value.trim(),rw=rwInput.value.trim();if(gh.length<20||rw.length<20){document.getElementById('error-message').textContent=lang==='fa'?'هر دو توکن را کامل وارد کنید.':'Enter both complete tokens.';show('error-view');return}ghInput.value='';rwInput.value='';show('progress-view');window.__activeStep=0;renderSteps(0);progressTimer=setInterval(function(){if(window.__activeStep<stepDefs.length-1){window.__activeStep+=1;renderSteps(window.__activeStep)}},3500);try{var response=await fetch('/api/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({githubToken:gh,railwayToken:rw}),cache:'no-store',credentials:'same-origin'});gh='';rw='';var data=await response.json();clearInterval(progressTimer);if(!response.ok||!data.ok)throw data;window.__activeStep=stepDefs.length;renderSteps(stepDefs.length);document.getElementById('panel-url').textContent=data.panelUrl;document.getElementById('admin-password').textContent=data.adminPassword;document.getElementById('fork-repository').textContent=data.forkRepository;document.getElementById('workspace-name').textContent=(data.workspaceName||'—')+' · '+(data.workspaceMode||'');document.getElementById('network-route').textContent=(data.networkRoute&&data.networkRoute.label)||'—';document.getElementById('open-panel').href=data.panelUrl;document.getElementById('open-railway').href=data.railwayProjectUrl;document.getElementById('success-copy').textContent=lang==='fa'?'دیپلوی شروع شده است. اگر پنل فوراً باز نشد، ۱ تا ۳ دقیقه صبر کنید. رمز ادمین را همین حالا ذخیره کنید.':'Deployment has started. If the panel is not ready yet, wait 1–3 minutes. Save the admin password now.';show('success-view')}catch(error){clearInterval(progressTimer);gh='';rw='';var detail=error&&error.error?error.error:null;var base=detail?(lang==='fa'?detail.messageFa:detail.messageEn):(lang==='fa'?'پاسخ نامعتبر از نصاب دریافت شد.':'The installer returned an invalid response.');var meta=detail?' ['+(detail.step||'unknown')+' / '+(detail.code||'UNKNOWN')+(detail.requestId?' / '+detail.requestId:'')+']':'';var extra=detail&&detail.details?' '+detail.details:'';document.getElementById('error-message').textContent=base+extra+meta;show('error-view')}});
+ function renderLiveProgress(status){if(!status)return;liveProgress=status;window.__activeStep=Number.isInteger(status.step)?status.step:window.__activeStep||0;renderSteps(window.__activeStep);var title=document.getElementById('progress-title'),detail=document.getElementById('progress-detail');title.textContent=lang==='fa'?(status.titleFa||'نصب در حال اجراست'):(status.titleEn||'Installation is running');var text=lang==='fa'?(status.detailFa||''):(status.detailEn||'');if(status.deploymentStatus)text+=(text?' · ':'')+(lang==='fa'?'وضعیت: ':'Status: ')+status.deploymentStatus;if(status.attempt&&status.maxAttempts)text+=(text?' · ':'')+(lang==='fa'?'بررسی ':'Check ')+status.attempt+'/'+status.maxAttempts;detail.textContent=text||(lang==='fa'?'صفحه را نبندید؛ وضعیت واقعی Deployment نمایش داده می‌شود.':'Keep this page open; the live Deployment status appears here.')}
+ async function responseJson(response){var text=await response.text();try{return JSON.parse(text)}catch(_){throw{error:{code:'INVALID_INSTALLER_RESPONSE',step:'installer-response',messageFa:'نصاب پاسخ JSON معتبر برنگرداند؛ نصب با شناسه وضعیت ادامه پیدا نکرد.',messageEn:'The installer did not return valid JSON, so no status identifier was received.',details:'HTTP '+response.status}}}}
+ async function pollInstall(installId){var transient=0;for(var poll=0;poll<300;poll+=1){try{var response=await fetch('/api/install/status?id='+encodeURIComponent(installId),{cache:'no-store',credentials:'same-origin'});var status=await responseJson(response);if(!response.ok||!status.ok)throw status;transient=0;renderLiveProgress(status);if(status.state==='completed')return status.result;if(status.state==='failed')throw{error:status.error};}catch(error){if(error&&error.error)throw error;transient+=1;if(transient>12)throw{error:{code:'STATUS_UNREACHABLE',step:'deployment-status',messageFa:'ارتباط با وضعیت نصب پس از چند تلاش برقرار نشد.',messageEn:'Installation status remained unreachable after repeated attempts.'}};document.getElementById('progress-detail').textContent=lang==='fa'?'در حال اتصال دوباره به وضعیت نصب…':'Reconnecting to installation status…'}await new Promise(function(resolve){setTimeout(resolve,2000)})}throw{error:{code:'STATUS_TIMEOUT',step:'deployment-status',messageFa:'زمان پیگیری وضعیت نصب تمام شد.',messageEn:'Installation status tracking timed out.'}}}
+ function showSuccess(data){window.__activeStep=stepDefs.length;renderSteps(stepDefs.length);document.getElementById('panel-url').textContent=data.panelUrl;document.getElementById('admin-password').textContent=data.adminPassword;document.getElementById('fork-repository').textContent=data.forkRepository;document.getElementById('workspace-name').textContent=(data.workspaceName||'—')+' · '+(data.workspaceMode||'');document.getElementById('network-route').textContent=(data.networkRoute&&data.networkRoute.label)||'—';document.getElementById('open-panel').href=data.panelUrl;document.getElementById('open-railway').href=data.railwayProjectUrl;document.getElementById('success-copy').textContent=lang==='fa'?'Deployment با موفقیت به پایان رسید و پنل آماده است. رمز ادمین را همین حالا ذخیره کنید.':'Deployment completed successfully and the panel is ready. Save the admin password now.';show('success-view')}
+ document.getElementById('install-form').addEventListener('submit',async function(event){event.preventDefault();var ghInput=document.getElementById('github-token'),rwInput=document.getElementById('railway-token');var gh=ghInput.value.trim(),rw=rwInput.value.trim();if(gh.length<20||rw.length<20){document.getElementById('error-message').textContent=lang==='fa'?'هر دو توکن را کامل وارد کنید.':'Enter both complete tokens.';show('error-view');return}ghInput.value='';rwInput.value='';liveProgress={step:0,titleFa:'آغاز نصب ایمن',titleEn:'Starting secure installation'};show('progress-view');renderLiveProgress(liveProgress);try{var response=await fetch('/api/install/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({githubToken:gh,railwayToken:rw}),cache:'no-store',credentials:'same-origin'});gh='';rw='';var accepted=await responseJson(response);if(!response.ok||!accepted.ok||!accepted.installId)throw accepted;var data=await pollInstall(accepted.installId);showSuccess(data)}catch(error){gh='';rw='';var detail=error&&error.error?error.error:null;var base=detail?(lang==='fa'?detail.messageFa:detail.messageEn):(lang==='fa'?'خطای نامشخصی در نصب رخ داد.':'An unknown installation error occurred.');var meta=detail?' ['+(detail.step||'unknown')+' / '+(detail.code||'UNKNOWN')+(detail.requestId?' / '+detail.requestId:'')+']':'';var extra=detail&&detail.details?' '+detail.details:'';document.getElementById('error-message').textContent=base+extra+meta;show('error-view')}});
  applyTheme();applyLocale();show('form-view');
 })();
 </script>
@@ -940,6 +1058,8 @@ html[data-theme="dark"]{
 
 
 const NETWORK_REFRESH_MS = 5 * 60 * 1000;
+const INSTALL_JOB_TTL_MS = 15 * 60 * 1000;
+const installJobs = new Map();
 
 function safeMessage(error) {
   return error instanceof InstallError ? error.messageEn : "The installer encountered an internal error.";
@@ -1063,6 +1183,24 @@ async function nodeHandler(req, res) {
     if (req.method === "GET" && url.pathname === "/") {
       return sendWebResponse(res, htmlResponse());
     }
+    if (req.method === "GET" && url.pathname === "/api/install/status") {
+      cleanInstallJobs();
+      const installId = String(url.searchParams.get("id") || "");
+      const job = /^[A-Za-z0-9_-]{20,80}$/.test(installId) ? installJobs.get(installId) : null;
+      if (!job) return sendJson(res, 404, { ok: false, error: { code: "INSTALL_NOT_FOUND", step: "deployment-status", messageFa: "شناسه نصب پیدا نشد یا منقضی شده است.", messageEn: "The installation identifier was not found or has expired." } });
+      const { updatedAtMs, ...visible } = job;
+      return sendJson(res, 200, { ok: true, installId, ...visible });
+    }
+    if (req.method === "POST" && url.pathname === "/api/install/start") {
+      if (activeInstalls >= 4) return sendJson(res, 429, { ok: false, error: { code: "BUSY", step: "request", messageFa: "نصاب مشغول است؛ کمی بعد دوباره تلاش کنید.", messageEn: "The installer is busy. Try again shortly." } }, { "retry-after": "15" });
+      const body = await readNodeBody(req);
+      const request = new Request(url, { method: "POST", headers: nodeHeaders(req), body });
+      const payload = await parseInstallRequest(request);
+      validateTokenShape(payload && payload.githubToken, "github");
+      validateTokenShape(payload && payload.railwayToken, "railway");
+      const installId = startInstallJob(payload);
+      return sendJson(res, 202, { ok: true, accepted: true, installId, statusUrl: "/api/install/status?id=" + encodeURIComponent(installId) });
+    }
     if (req.method === "POST" && url.pathname === "/api/install") {
       if (activeInstalls >= 4) return sendJson(res, 429, { ok: false, code: "BUSY", message: "Installer is busy. Try again shortly." }, { "retry-after": "15" });
       const body = await readNodeBody(req);
@@ -1073,25 +1211,15 @@ async function nodeHandler(req, res) {
     }
     return sendJson(res, 404, { ok: false, code: "NOT_FOUND", message: "Not found" });
   } catch (error) {
-    const requestId = randomSecret(9);
-    const known = error instanceof InstallError;
-    const detail = {
-      code: known ? error.code : "INTERNAL_ERROR",
-      step: known ? error.step : "internal",
-      messageEn: known ? error.messageEn : "The installer encountered an internal error.",
-      messageFa: known ? error.messageFa : "نصاب با یک خطای داخلی روبه‌رو شد.",
-      details: known && error.safeDetails ? error.safeDetails : undefined,
-      routeAttempts: known && error.routeAttempts ? error.routeAttempts : undefined,
-      requestId,
-    };
-    console.error(`[install:${requestId}] code=${detail.code} step=${detail.step}` + (detail.details ? ` details=${detail.details}` : ""));
-    return sendJson(res, known ? error.status : 500, { ok: false, error: detail });
+    const detail = installErrorDetail(error);
+    console.error(`[install:${detail.requestId}] code=${detail.code} step=${detail.step}` + (detail.details ? ` details=${detail.details}` : ""));
+    return sendJson(res, error instanceof InstallError ? error.status : 500, { ok: false, error: detail });
   }
 }
 
 export function createInstallerServer() {
   const server = http.createServer(nodeHandler);
-  server.requestTimeout = 180_000;
+  server.requestTimeout = 360_000;
   server.headersTimeout = 15_000;
   server.keepAliveTimeout = 5_000;
   return server;
@@ -1115,6 +1243,10 @@ export const __test = {
   selectAuthenticatedTransport,
   ensureWorkspace,
   railwayProjectName,
+  deploymentPollDelayMs,
+  publicProgress,
+  startInstallJob,
+  installJobs,
   routeLabel,
   refreshDeploymentNetwork,
   publicNetworkState,
@@ -1125,7 +1257,7 @@ async function start() {
   const port = Number.parseInt(process.env.PORT || "3000", 10);
   const server = createInstallerServer();
   server.listen(port, "0.0.0.0", () => {
-    console.log(`Lumen Railway installer v27 listening on ${port}`);
+    console.log(`Lumen Railway installer v28 listening on ${port}`);
     void refreshDeploymentNetwork();
   });
   const timer = setInterval(() => { void refreshDeploymentNetwork(); }, NETWORK_REFRESH_MS);

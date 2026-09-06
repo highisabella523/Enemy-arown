@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 
 /*
- * Lumen public self-contained Railway service installer — v26.0.0
+ * Lumen public self-contained Railway service installer — v27.0.0
  * Every user deploys this folder as a service in their own Railway account.
  * Runs on Node.js 22 with node:net/node:tls.
  * It does not persist submitted tokens and never writes them to logs.
@@ -16,7 +16,7 @@ const SOURCE_REPO = "Lumen-Project-Final";
 const SOURCE_FULL = SOURCE_OWNER + "/" + SOURCE_REPO;
 const GITHUB_API = "https://api.github.com";
 const RAILWAY_API = "https://backboard.railway.com/graphql/v2";
-const INSTALLER_VERSION = "26.0.0";
+const INSTALLER_VERSION = "27.0.0";
 const MAX_BODY_BYTES = 24 * 1024;
 const MAX_UPSTREAM_BYTES = 4 * 1024 * 1024;
 const HTTP_PROXIES = Object.freeze([
@@ -618,16 +618,44 @@ async function ensureWorkspace(route, railwayToken, ownerLogin) {
   );
 }
 
+function railwayProjectName(ownerLogin, entropy = Date.now().toString(36)) {
+  const owner = String(ownerLogin || "app")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "app";
+  const tag = String(entropy || "deploy")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .slice(-8) || "deploy";
+  const ownerLimit = Math.max(1, 32 - "lumen--".length - tag.length);
+  return ("lumen-" + owner.slice(0, ownerLimit).replace(/-+$/g, "") + "-" + tag)
+    .replace(/-+/g, "-")
+    .slice(0, 32)
+    .replace(/-+$/g, "");
+}
+
 async function provisionRailway(route, railwayToken, githubToken, fork, branch, commitSha, adminPassword) {
   const workspace = await ensureWorkspace(route, railwayToken, fork.owner.login);
-  const projectName = "Lumen " + String(fork.owner.login).slice(0, 20) + " " + new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
-  const created = await railway(
-    route,
-    railwayToken,
-    "mutation InstallerProject($input: ProjectCreateInput!) { projectCreate(input: $input) { id name environments { edges { node { id name } } } } }",
-    { input: { workspaceId: workspace.id, name: projectName, description: "Lumen installed by the Railway installer", defaultEnvironmentName: "production" } },
-    "project"
-  );
+  let projectName = railwayProjectName(fork.owner.login);
+  let created;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      created = await railway(
+        route,
+        railwayToken,
+        "mutation InstallerProject($input: ProjectCreateInput!) { projectCreate(input: $input) { id name environments { edges { node { id name } } } } }",
+        { input: { workspaceId: workspace.id, name: projectName, description: "Lumen installed by the Railway installer", defaultEnvironmentName: "production" } },
+        "project"
+      );
+      break;
+    } catch (error) {
+      if (attempt === 0 && /invalid project name/i.test(String(error && error.safeDetails || ""))) {
+        projectName = railwayProjectName("app", randomSecret(12));
+        continue;
+      }
+      throw error;
+    }
+  }
   const project = created.projectCreate;
   if (!project || !project.id) throw new InstallError("PROJECT_CREATE_FAILED", "project", "Railway did not return the new project.", "Railway پروژه جدید را برنگرداند.", 502);
 
@@ -865,8 +893,8 @@ html[data-theme="dark"]{
 </header>
 <main class="layout">
  <section class="hero" aria-labelledby="hero-title">
-  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۶" data-en="Public Lumen installer · v26">نصاب عمومی Lumen · نسخه ۲۶</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
-  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v26</span><span class="chip">6 proxies + direct</span></div></div>
+  <div><div class="eyebrow"><span aria-hidden="true">✦</span><span data-fa="نصاب عمومی Lumen · نسخه ۲۷" data-en="Public Lumen installer · v27">نصاب عمومی Lumen · نسخه ۲۷</span></div><h1 id="hero-title" data-fa="نصب Lumen روی Railway" data-en="Install Lumen on Railway">نصب Lumen روی Railway</h1><p data-fa="فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد." data-en="Enter two tokens. The installer forks the official repository, configures persistent storage and Railway, deploys the service, and returns the panel URL.">فقط دو توکن را وارد کنید. نصاب مخزن رسمی را فورک می‌کند، فضای دائمی و تنظیمات Railway را می‌سازد و لینک پنل را تحویل می‌دهد.</p></div>
+  <div class="source-card"><div class="source-label" data-fa="سورس ثابت و رسمی" data-en="Fixed official source">سورس ثابت و رسمی</div><div class="source-name">highisabella52213/Lumen-Project-Final</div><div class="source-meta"><span class="chip">WS only</span><span class="chip">Railway</span><span class="chip">v27</span><span class="chip">6 proxies + direct</span></div></div>
  </section>
  <section class="panel">
   <div class="view" id="form-view">
@@ -1086,6 +1114,7 @@ export const __test = {
   selectTransport,
   selectAuthenticatedTransport,
   ensureWorkspace,
+  railwayProjectName,
   routeLabel,
   refreshDeploymentNetwork,
   publicNetworkState,
@@ -1096,7 +1125,7 @@ async function start() {
   const port = Number.parseInt(process.env.PORT || "3000", 10);
   const server = createInstallerServer();
   server.listen(port, "0.0.0.0", () => {
-    console.log(`Lumen Railway installer v26 listening on ${port}`);
+    console.log(`Lumen Railway installer v27 listening on ${port}`);
     void refreshDeploymentNetwork();
   });
   const timer = setInterval(() => { void refreshDeploymentNetwork(); }, NETWORK_REFRESH_MS);
